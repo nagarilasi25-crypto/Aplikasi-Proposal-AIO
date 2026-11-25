@@ -1,0 +1,264 @@
+{
+  "entities": {
+    "Institution": {
+      "title": "Institution",
+      "description": "Profil resmi lembaga Rumah Quran Ar Raudhah sebagai sumber data otomatis seluruh proposal.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "maxLength": 200 },
+        "logoUrl": { "type": "string", "maxLength": 2000 },
+        "photoUrl": { "type": "string", "maxLength": 2000 },
+        "address": { "type": "string", "maxLength": 500 },
+        "kecamatan": { "type": "string", "maxLength": 120 },
+        "kabupaten": { "type": "string", "maxLength": 120 },
+        "provinsi": { "type": "string", "maxLength": 120 },
+        "negara": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 50 },
+        "email": { "type": "string", "maxLength": 150 },
+        "foundedYear": { "type": "string", "maxLength": 10 },
+        "statisticNumber": { "type": "string", "maxLength": 100 },
+        "legalityInfo": { "type": "string", "maxLength": 2000 },
+        "leaderName": { "type": "string", "maxLength": 150 },
+        "history": { "type": "string", "maxLength": 10000 },
+        "vision": { "type": "string", "maxLength": 3000 },
+        "mission": { "type": "string", "maxLength": 5000 },
+        "organizationStructure": { "type": "string", "maxLength": 5000 },
+        "studentCount": { "type": "number" },
+        "teacherCount": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["name", "address", "createdAt", "updatedAt", "createdBy", "updatedBy"]
+    },
+    "User": {
+      "title": "User",
+      "description": "Data pengguna sistem dengan kontrol hak akses berbasis peran (Administrator, Pimpinan, Operator).",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 150 },
+        "email": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "photoURL": { "type": "string", "maxLength": 2000 },
+        "phone": { "type": "string", "maxLength": 50 },
+        "position": { "type": "string", "maxLength": 150 },
+        "role": { "type": "string", "enum": ["Administrator", "Pimpinan", "Operator"] },
+        "status": { "type": "string", "enum": ["active", "pending", "inactive"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["uid", "displayName", "email", "role", "status", "createdAt", "updatedAt", "createdBy", "updatedBy"]
+    },
+    "ProposalCategory": {
+      "title": "ProposalCategory",
+      "description": "Master kategori proposal lembaga.",
+      "type": "object",
+      "properties": {
+        "institutionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "name": { "type": "string", "minLength": 2, "maxLength": 150 },
+        "code": { "type": "string", "maxLength": 30 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["institutionId", "name", "isActive", "createdAt", "updatedAt", "createdBy", "updatedBy"]
+    },
+    "ProposalTemplate": {
+      "title": "ProposalTemplate",
+      "description": "Master template struktur bab proposal.",
+      "type": "object",
+      "properties": {
+        "institutionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "name": { "type": "string", "minLength": 2, "maxLength": 150 },
+        "type": { "type": "string", "maxLength": 100 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "sections": { "type": "array" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["institutionId", "name", "sections", "isActive", "createdAt", "updatedAt", "createdBy", "updatedBy"]
+    },
+    "Proposal": {
+      "title": "Proposal",
+      "description": "Dokumen proposal pengajuan bantuan atau program lembaga.",
+      "type": "object",
+      "properties": {
+        "institutionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "proposalNumber": { "type": "string", "maxLength": 100 },
+        "proposalDate": { "type": "string", "maxLength": 30 },
+        "fiscalYear": { "type": "number" },
+        "title": { "type": "string", "minLength": 3, "maxLength": 300 },
+        "categoryId": { "type": "string", "maxLength": 128 },
+        "categoryName": { "type": "string", "maxLength": 150 },
+        "proposalType": { "type": "string", "maxLength": 150 },
+        "recipientName": { "type": "string", "maxLength": 200 },
+        "recipientInstitution": { "type": "string", "maxLength": 200 },
+        "status": {
+          "type": "string",
+          "enum": [
+            "Draft",
+            "Menunggu persetujuan",
+            "Siap diajukan",
+            "Sudah diajukan",
+            "Dalam proses",
+            "Disetujui",
+            "Ditolak",
+            "Bantuan diterima",
+            "Selesai"
+          ]
+        },
+        "totalBudget": { "type": "number" },
+        "approvedAmount": { "type": "number" },
+        "receivedAmount": { "type": "number" },
+        "submittedAt": { "type": "string", "maxLength": 40 },
+        "followUpNotes": { "type": "string", "maxLength": 3000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["institutionId", "title", "fiscalYear", "status", "totalBudget", "createdAt", "updatedAt", "createdBy", "updatedBy"]
+    },
+    "ProposalBudget": {
+      "title": "ProposalBudget",
+      "description": "Rencana Anggaran Biaya (RAB) yang terhubung ke proposal.",
+      "type": "object",
+      "properties": {
+        "institutionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "proposalId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "workGroup": { "type": "string", "maxLength": 150 },
+        "items": { "type": "array" },
+        "totalAmount": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["institutionId", "proposalId", "items", "totalAmount", "createdAt", "updatedAt", "createdBy", "updatedBy"]
+    },
+    "ProposalAttachment": {
+      "title": "ProposalAttachment",
+      "description": "Dokumentasi foto dan lampiran pendukung proposal.",
+      "type": "object",
+      "properties": {
+        "institutionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "proposalId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "category": { "type": "string", "maxLength": 100 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "fileUrl": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "fileName": { "type": "string", "maxLength": 255 },
+        "fileType": { "type": "string", "maxLength": 100 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["institutionId", "proposalId", "category", "title", "fileUrl", "createdAt", "updatedAt", "createdBy", "updatedBy"]
+    },
+    "ProposalArchive": {
+      "title": "ProposalArchive",
+      "description": "Arsip proposal beserta snapshot dokumen dan file hasil cetak.",
+      "type": "object",
+      "properties": {
+        "institutionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "proposalId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "proposalNumber": { "type": "string", "maxLength": 100 },
+        "title": { "type": "string", "minLength": 3, "maxLength": 300 },
+        "categoryName": { "type": "string", "maxLength": 150 },
+        "fiscalYear": { "type": "number" },
+        "proposalDate": { "type": "string", "maxLength": 30 },
+        "recipientInstitution": { "type": "string", "maxLength": 200 },
+        "totalBudget": { "type": "number" },
+        "status": { "type": "string", "maxLength": 60 },
+        "exportedFileUrl": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["institutionId", "proposalId", "title", "fiscalYear", "status", "createdAt", "updatedAt", "createdBy", "updatedBy"]
+    },
+    "ProposalStatusHistory": {
+      "title": "ProposalStatusHistory",
+      "description": "Riwayat perubahan status pengajuan proposal.",
+      "type": "object",
+      "properties": {
+        "institutionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "proposalId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "fromStatus": { "type": "string", "maxLength": 60 },
+        "toStatus": { "type": "string", "maxLength": 60 },
+        "notes": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "required": ["institutionId", "proposalId", "toStatus", "createdAt", "createdBy"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Catatan audit aktivitas penting sistem.",
+      "type": "object",
+      "properties": {
+        "institutionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "action": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "entityType": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "entityId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "actorUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "actorName": { "type": "string", "maxLength": 150 },
+        "details": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["institutionId", "action", "entityType", "entityId", "actorUid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/institutions/{institutionId}": {
+      "schema": { "$ref": "#/entities/Institution" },
+      "description": "Profil lembaga Rumah Quran Ar Raudhah."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "Data pengguna dan hak akses peran."
+    },
+    "/proposalCategories/{categoryId}": {
+      "schema": { "$ref": "#/entities/ProposalCategory" },
+      "description": "Master kategori proposal."
+    },
+    "/proposalTemplates/{templateId}": {
+      "schema": { "$ref": "#/entities/ProposalTemplate" },
+      "description": "Master template struktur bab proposal."
+    },
+    "/proposals/{proposalId}": {
+      "schema": { "$ref": "#/entities/Proposal" },
+      "description": "Data utama proposal pengajuan."
+    },
+    "/proposalBudgets/{budgetId}": {
+      "schema": { "$ref": "#/entities/ProposalBudget" },
+      "description": "Data Rencana Anggaran Biaya (RAB) proposal."
+    },
+    "/proposalAttachments/{attachmentId}": {
+      "schema": { "$ref": "#/entities/ProposalAttachment" },
+      "description": "Lampiran dokumentasi dan berkas pendukung proposal."
+    },
+    "/proposalArchives/{archiveId}": {
+      "schema": { "$ref": "#/entities/ProposalArchive" },
+      "description": "Arsip proposal tersimpan dan siap telusur."
+    },
+    "/proposalStatusHistory/{historyId}": {
+      "schema": { "$ref": "#/entities/ProposalStatusHistory" },
+      "description": "Riwayat perubahan status pengajuan proposal."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Log audit keamanan dan perubahan data."
+    }
+  }
+}
