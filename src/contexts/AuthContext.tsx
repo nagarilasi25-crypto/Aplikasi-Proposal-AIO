@@ -13,11 +13,45 @@ import {
   getOfflineKV,
   getOfflineMutationQueue,
   hasAnyOfflineAccount,
+  hasOfflineUsername,
   removeOfflineMutation,
   setOfflineKV,
-  verifyOfflineAuthCredential,
+  verifyOfflineAuthCredentialDetailed,
 } from '../lib/offlineDb';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
+
+interface ParsedApiResponse<T> {
+  ok: boolean;
+  status: number;
+  isJson: boolean;
+  data: T | null;
+}
+
+async function parseJsonResponse<T = Record<string, unknown>>(
+  res: Response
+): Promise<ParsedApiResponse<T>> {
+  let rawText = '';
+  try {
+    rawText = await res.text();
+  } catch {
+    return { ok: false, status: res.status, isJson: false, data: null };
+  }
+
+  const trimmed = rawText.trim();
+  if (!trimmed) {
+    return { ok: res.ok, status: res.status, isJson: false, data: null };
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as T;
+    if (parsed !== null && typeof parsed === 'object') {
+      return { ok: res.ok, status: res.status, isJson: true, data: parsed };
+    }
+    return { ok: false, status: res.status, isJson: false, data: null };
+  } catch {
+    return { ok: false, status: res.status, isJson: false, data: null };
+  }
+}
 
 interface AuthContextValue {
   appUser: AppUser | null;
@@ -92,18 +126,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const checkBootstrapStatus = useCallback(async () => {
     setAuthLoading(true);
     try {
-      const res = await fetch('/api/auth/bootstrap-status');
-      if (res.ok) {
-        const data = (await res.json()) as {
-          needsSetup: boolean;
-          hasEnvAdminPasscode: boolean;
-        };
-        setNeedsSetup(data.needsSetup);
-        setHasEnvAdminPasscode(data.hasEnvAdminPasscode);
+      const res = await fetch('/api/auth/bootstrap-status', {
+        headers: { Accept: 'application/json' },
+      });
+      const parsed = await parseJsonResponse<{
+        needsSetup?: boolean;
+        hasEnvAdminPasscode?: boolean;
+      }>(res);
+      if (parsed.ok && parsed.isJson && typeof parsed.data?.needsSetup === 'boolean') {
+        setNeedsSetup(parsed.data.needsSetup);
+        setHasEnvAdminPasscode(Boolean(parsed.data.hasEnvAdminPasscode));
+        return;
       }
+      const hasLocal = await hasAnyOfflineAccount();
+      setNeedsSetup(!hasLocal);
+      setHasEnvAdminPasscode(false);
     } catch {
       const hasLocal = await hasAnyOfflineAccount();
       setNeedsSetup(!hasLocal);
+      setHasEnvAdminPasscode(false);
     } finally {
       await refreshQueueCount();
       setAuthLoading(false);
@@ -124,6 +165,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     ): Promise<T> => {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
+        Accept: 'application/json',
       };
       if (sessionToken) {
         headers.Authorization = `Bearer ${sessionToken}`;
@@ -135,11 +177,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         body: options?.body ? JSON.stringify(options.body) : undefined,
       });
 
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error((data as { error?: string }).error || 'Permintaan gagal diproses.');
+      const parsed = await parseJsonResponse<T & { error?: string }>(res);
+      if (!parsed.isJson) {
+        throw new Error('Layanan server tidak merespons dengan benar. Coba beberapa saat lagi.');
       }
-      return data as T;
+      if (!parsed.ok) {
+        throw new Error(parsed.data?.error || 'Permintaan gagal diproses.');
+      }
+      return parsed.data as T;
     },
     [sessionToken]
   );
@@ -234,27 +279,78 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await refreshQueueCount();
   };
 
+  const applyLocalOfflineSession = async (user: AppUser) => {
+    setSessionToken(null);
+    setAppUser(user);
+    setIsOfflineSession(true);
+    setPendingStatusUser(null);
+    setNeedsSetup(false);
+    await refreshDashboardData();
+  };
+
   const setupFirstAdmin = async (username: string, displayName: string, password: string) => {
     setSigningIn(true);
     setAuthError(null);
     setAuthNotice(null);
     try {
-      const res = await fetch('/api/auth/setup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, displayName, password }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Gagal membuat akun Administrator pertama.');
+      if (navigator.onLine) {
+        const res = await fetch('/api/auth/setup', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({ username, displayName, password }),
+        });
+        const parsed = await parseJsonResponse<{
+          token?: string;
+          user?: AppUser;
+          institution?: InstitutionProfile;
+          error?: string;
+        }>(res);
+
+        if (parsed.isJson) {
+          if (!parsed.ok || !parsed.data?.token || !parsed.data?.user) {
+            throw new Error(parsed.data?.error || 'Gagal membuat akun Administrator pertama.');
+          }
+          await applyAuthenticatedSession(
+            username,
+            password,
+            parsed.data.token,
+            parsed.data.user,
+            parsed.data.institution || EMPTY_INSTITUTION
+          );
+          return;
+        }
       }
-      await applyAuthenticatedSession(
-        username,
-        password,
-        data.token,
-        data.user,
-        data.institution
-      );
+
+      // Offline / static hosting fallback for initial setup
+      const hasLocal = await hasAnyOfflineAccount();
+      if (hasLocal) {
+        setNeedsSetup(false);
+        setAuthError('Akun Administrator sudah terdaftar pada perangkat ini. Silakan masuk.');
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const localUid = `local_admin_${Date.now()}`;
+      const localAdmin: AppUser = {
+        uid: localUid,
+        username: username.trim(),
+        displayName: displayName.trim() || username.trim(),
+        email: '',
+        phone: '',
+        position: 'Administrator Sistem',
+        role: 'Administrator',
+        status: 'active',
+        createdAt: now,
+        updatedAt: now,
+        createdBy: localUid,
+        updatedBy: localUid,
+      };
+      await cacheOfflineAuthCredential(username, password, localAdmin);
+      await setOfflineKV('institution', EMPTY_INSTITUTION);
+      await applyLocalOfflineSession(localAdmin);
     } catch (err) {
       setAuthError(
         err instanceof Error
@@ -271,55 +367,86 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAuthError(null);
     setAuthNotice(null);
 
+    let serverUnavailable = !navigator.onLine;
+
     try {
       if (navigator.onLine) {
         const res = await fetch('/api/auth/login', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
           body: JSON.stringify({ username, password }),
         });
-        const data = await res.json();
+        const parsed = await parseJsonResponse<{
+          code?: string;
+          error?: string;
+          token?: string;
+          user?: AppUser;
+          institution?: InstitutionProfile;
+        }>(res);
 
-        if (!res.ok) {
-          if (data.code === 'ACCOUNT_PENDING' || data.code === 'ACCOUNT_INACTIVE') {
-            setPendingStatusUser(data.user);
-            return;
+        if (parsed.isJson) {
+          if (!parsed.ok) {
+            if (
+              (parsed.data?.code === 'ACCOUNT_PENDING' ||
+                parsed.data?.code === 'ACCOUNT_INACTIVE') &&
+              parsed.data.user
+            ) {
+              setPendingStatusUser(parsed.data.user);
+              return;
+            }
+            throw new Error(parsed.data?.error || 'Nama atau kata sandi tidak sesuai.');
           }
-          throw new Error(data.error || 'Nama atau kata sandi tidak sesuai.');
+          if (!parsed.data?.token || !parsed.data?.user) {
+            throw new Error('Respons autentikasi dari server tidak lengkap.');
+          }
+          await applyAuthenticatedSession(
+            username,
+            password,
+            parsed.data.token,
+            parsed.data.user,
+            parsed.data.institution || EMPTY_INSTITUTION
+          );
+          return;
         }
 
-        await applyAuthenticatedSession(
-          username,
-          password,
-          data.token,
-          data.user,
-          data.institution
-        );
+        // Proxy/CDN returned non-JSON (e.g. 404 "The page could not be found" or 502/503)
+        serverUnavailable = true;
+      }
+    } catch (err) {
+      const isNetworkIssue = !navigator.onLine || err instanceof TypeError;
+      if (!isNetworkIssue) {
+        setAuthError(err instanceof Error ? err.message : 'Gagal masuk ke sistem.');
+        setSigningIn(false);
         return;
       }
+      serverUnavailable = true;
+    }
 
-      throw new TypeError('Offline');
-    } catch (err) {
-      // Offline fallback: verify locally against PBKDF2-SHA256 cache in IndexedDB
-      const isNetworkIssue =
-        !navigator.onLine || err instanceof TypeError || (err instanceof Error && err.message === 'Offline');
-      if (isNetworkIssue) {
-        const offlineUser = await verifyOfflineAuthCredential(username, password);
-        if (offlineUser) {
-          setSessionToken(null);
-          setAppUser(offlineUser);
-          setIsOfflineSession(true);
-          setPendingStatusUser(null);
-          await refreshDashboardData();
+    // Offline or server-unavailable fallback: verify locally against PBKDF2-SHA256 cache in IndexedDB
+    try {
+      if (serverUnavailable) {
+        const localCheck = await verifyOfflineAuthCredentialDetailed(username, password);
+        if (localCheck.status === 'ok') {
+          if (localCheck.user.status === 'pending' || localCheck.user.status === 'inactive') {
+            setPendingStatusUser(localCheck.user);
+            return;
+          }
+          await applyLocalOfflineSession(localCheck.user);
+          return;
+        }
+        if (localCheck.status === 'wrong_password') {
+          setAuthError('Nama atau kata sandi tidak sesuai.');
           return;
         }
         setAuthError(
-          'Perangkat sedang offline dan akun ini belum pernah masuk sebelumnya pada peramban ini.'
+          !navigator.onLine
+            ? 'Perangkat sedang offline dan akun ini belum pernah masuk sebelumnya pada peramban ini.'
+            : 'Layanan server sedang tidak tersedia dan akun ini belum tersimpan secara lokal di peramban ini.'
         );
-        return;
       }
-
-      setAuthError(err instanceof Error ? err.message : 'Gagal masuk ke sistem.');
     } finally {
       setSigningIn(false);
     }
@@ -335,18 +462,66 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       const res = await fetch('/api/auth/register', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
         body: JSON.stringify({ username, displayName, password }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Gagal mendaftarkan akun.');
+      const parsed = await parseJsonResponse<{
+        message?: string;
+        error?: string;
+        user?: AppUser;
+      }>(res);
+
+      if (parsed.isJson) {
+        if (!parsed.ok) {
+          throw new Error(parsed.data?.error || 'Gagal mendaftarkan akun.');
+        }
+        setAuthNotice(
+          parsed.data?.message ||
+            'Pendaftaran berhasil. Menunggu aktivasi oleh Administrator.'
+        );
+        return;
       }
+
+      // Non-JSON response (e.g., static preview / server endpoint unavailable)
+      const hasLocal = await hasAnyOfflineAccount();
+      if (!hasLocal) {
+        throw new Error(
+          'Layanan server sedang tidak tersedia. Muat ulang halaman atau coba beberapa saat lagi.'
+        );
+      }
+      const existsLocally = await hasOfflineUsername(username);
+      if (existsLocally) {
+        throw new Error('Nama pengguna tersebut sudah terdaftar. Gunakan nama lain.');
+      }
+      const now = new Date().toISOString();
+      const localUid = `local_usr_${Date.now()}`;
+      const localPendingUser: AppUser = {
+        uid: localUid,
+        username: username.trim(),
+        displayName: displayName.trim() || username.trim(),
+        email: '',
+        phone: '',
+        position: '',
+        role: 'Operator',
+        status: 'pending',
+        createdAt: now,
+        updatedAt: now,
+        createdBy: localUid,
+        updatedBy: localUid,
+      };
+      await cacheOfflineAuthCredential(username, password, localPendingUser);
       setAuthNotice(
-        data.message || 'Pendaftaran berhasil. Menunggu aktivasi oleh Administrator.'
+        'Pendaftaran dicatat pada perangkat ini dengan status Menunggu Aktivasi oleh Administrator.'
       );
     } catch (err) {
-      setAuthError(err instanceof Error ? err.message : 'Gagal mendaftarkan akun.');
+      if (err instanceof TypeError) {
+        setAuthError('Tidak dapat terhubung ke server pendaftaran. Periksa koneksi internet Anda.');
+      } else {
+        setAuthError(err instanceof Error ? err.message : 'Gagal mendaftarkan akun.');
+      }
     } finally {
       setSigningIn(false);
     }

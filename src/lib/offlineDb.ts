@@ -100,11 +100,18 @@ export async function cacheOfflineAuthCredential(
   });
 }
 
-export async function verifyOfflineAuthCredential(
+export type OfflineVerifyResult =
+  | { status: 'ok'; user: AppUser }
+  | { status: 'wrong_password' }
+  | { status: 'not_found' };
+
+export async function verifyOfflineAuthCredentialDetailed(
   username: string,
   password: string
-): Promise<AppUser | null> {
-  if (typeof indexedDB === 'undefined' || !crypto?.subtle) return null;
+): Promise<OfflineVerifyResult> {
+  if (typeof indexedDB === 'undefined' || !crypto?.subtle) {
+    return { status: 'not_found' };
+  }
   const db = await openOfflineDb();
   const record = await new Promise<OfflineAuthRecord | undefined>((resolve, reject) => {
     const tx = db.transaction('offlineAuth', 'readonly');
@@ -113,14 +120,35 @@ export async function verifyOfflineAuthCredential(
     req.onerror = () => reject(req.error);
   });
 
-  if (!record) return null;
+  if (!record) return { status: 'not_found' };
   const candidateHash = await derivePbkdf2(password, fromHex(record.saltHex));
-  if (candidateHash.length !== record.hashHex.length) return null;
+  if (candidateHash.length !== record.hashHex.length) {
+    return { status: 'wrong_password' };
+  }
   let diff = 0;
   for (let i = 0; i < candidateHash.length; i++) {
     diff |= candidateHash.charCodeAt(i) ^ record.hashHex.charCodeAt(i);
   }
-  return diff === 0 ? record.user : null;
+  return diff === 0 ? { status: 'ok', user: record.user } : { status: 'wrong_password' };
+}
+
+export async function verifyOfflineAuthCredential(
+  username: string,
+  password: string
+): Promise<AppUser | null> {
+  const result = await verifyOfflineAuthCredentialDetailed(username, password);
+  return result.status === 'ok' ? result.user : null;
+}
+
+export async function hasOfflineUsername(username: string): Promise<boolean> {
+  if (typeof indexedDB === 'undefined') return false;
+  const db = await openOfflineDb();
+  return new Promise<boolean>((resolve, reject) => {
+    const tx = db.transaction('offlineAuth', 'readonly');
+    const req = tx.objectStore('offlineAuth').get(username.trim().toLowerCase());
+    req.onsuccess = () => resolve(Boolean(req.result));
+    req.onerror = () => reject(req.error);
+  });
 }
 
 export async function hasAnyOfflineAccount(): Promise<boolean> {

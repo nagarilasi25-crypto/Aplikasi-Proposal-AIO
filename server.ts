@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import express, { NextFunction, Request, Response } from 'express';
 
@@ -823,11 +824,30 @@ async function startServer() {
     });
   });
 
+  // 9. Explicit JSON 404 & error handlers for /api/* so API calls never receive HTML/text 404s
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Endpoint API tidak ditemukan.' });
+  });
+
+  app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const message =
+      err instanceof Error ? err.message : 'Terjadi kesalahan internal pada server.';
+    res.status(500).json({ error: message });
+  });
+
+  const httpServer = http.createServer(app);
+
   // Mount Vite middleware in dev, or serve static dist/ in production
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: {
+          server: httpServer,
+        },
+        watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -839,7 +859,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
 }
