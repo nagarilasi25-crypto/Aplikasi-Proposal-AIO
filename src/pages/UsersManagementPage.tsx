@@ -19,7 +19,15 @@ import {
   UserStatus,
 } from '../types/models';
 import { formatTanggalIndonesia, sanitizeString } from '../lib/formatters';
-import { getOfflineKV, setOfflineKV } from '../lib/offlineDb';
+import {
+  cacheOfflineAuthCredential,
+  deleteOfflineAuthUser,
+  getAllOfflineUsers,
+  getOfflineKV,
+  hasOfflineUsername,
+  setOfflineKV,
+  updateOfflineAuthUserMetadata,
+} from '../lib/offlineDb';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
 
 const STATUS_LABELS: Record<UserStatus, string> = {
@@ -81,7 +89,25 @@ export function UsersManagementPage() {
   const [deleting, setDeleting] = useState(false);
 
   const isAdmin = appUser?.role === 'Administrator';
-  const canMutate = isOnline && !isOfflineSession;
+  const useServerApi = isOnline && !isOfflineSession;
+  const canMutate = isAdmin;
+
+  const loadLocalMergedUsers = useCallback(async (): Promise<AppUser[]> => {
+    const [cached, offlineAuthUsers] = await Promise.all([
+      getOfflineKV<AppUser[]>('users'),
+      getAllOfflineUsers(),
+    ]);
+    const byUid = new Map<string, AppUser>();
+    for (const u of cached || []) {
+      byUid.set(u.uid, u);
+    }
+    for (const u of offlineAuthUsers) {
+      byUid.set(u.uid, u);
+    }
+    return Array.from(byUid.values()).sort((a, b) =>
+      a.displayName.localeCompare(b.displayName)
+    );
+  }, []);
 
   const loadUsers = useCallback(async () => {
     if (!isAdmin) {
@@ -90,7 +116,7 @@ export function UsersManagementPage() {
     }
     setLoading(true);
     try {
-      if (isOnline && !isOfflineSession) {
+      if (useServerApi) {
         const res = await apiRequest<{ users: AppUser[] }>('/api/users');
         const list = (res.users || []).sort((a, b) =>
           a.displayName.localeCompare(b.displayName)
@@ -98,16 +124,17 @@ export function UsersManagementPage() {
         setUsers(list);
         await setOfflineKV('users', list);
       } else {
-        const cached = await getOfflineKV<AppUser[]>('users');
-        setUsers(cached || []);
+        const merged = await loadLocalMergedUsers();
+        setUsers(merged);
+        await setOfflineKV('users', merged);
       }
     } catch {
-      const cached = await getOfflineKV<AppUser[]>('users');
-      setUsers(cached || []);
+      const merged = await loadLocalMergedUsers();
+      setUsers(merged);
     } finally {
       setLoading(false);
     }
-  }, [apiRequest, isAdmin, isOfflineSession, isOnline]);
+  }, [apiRequest, isAdmin, loadLocalMergedUsers, useServerApi]);
 
   useEffect(() => {
     loadUsers();
@@ -143,26 +170,62 @@ export function UsersManagementPage() {
 
   const handleAddUser = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!canMutate) return;
+    if (!canMutate || !appUser) return;
+
+    const cleanUsername = addForm.username.trim();
+    const cleanDisplayName = sanitizeString(
+      addForm.displayName || cleanUsername,
+      BLUEPRINT_LIMITS.user.displayNameMax
+    );
+    const cleanPhone = sanitizeString(addForm.phone, BLUEPRINT_LIMITS.user.phoneMax);
+    const cleanPosition = sanitizeString(addForm.position, BLUEPRINT_LIMITS.user.positionMax);
 
     setSavingAdd(true);
     try {
-      await apiRequest('/api/users', {
-        method: 'POST',
-        body: {
-          username: addForm.username.trim(),
-          displayName: sanitizeString(
-            addForm.displayName || addForm.username,
-            BLUEPRINT_LIMITS.user.displayNameMax
-          ),
-          password: addForm.password,
-          phone: sanitizeString(addForm.phone, BLUEPRINT_LIMITS.user.phoneMax),
-          position: sanitizeString(addForm.position, BLUEPRINT_LIMITS.user.positionMax),
+      if (useServerApi) {
+        await apiRequest('/api/users', {
+          method: 'POST',
+          body: {
+            username: cleanUsername,
+            displayName: cleanDisplayName,
+            password: addForm.password,
+            phone: cleanPhone,
+            position: cleanPosition,
+            role: addForm.role,
+            status: addForm.status,
+          },
+        });
+      } else {
+        if (cleanUsername.length < 3) {
+          throw new Error('Nama pengguna minimal 3 karakter.');
+        }
+        if (addForm.password.length < 6) {
+          throw new Error('Kata sandi minimal 6 karakter.');
+        }
+        if (await hasOfflineUsername(cleanUsername)) {
+          throw new Error('Nama pengguna sudah digunakan.');
+        }
+        const now = new Date().toISOString();
+        const localUser: AppUser = {
+          uid: `local_usr_${Date.now()}`,
+          username: cleanUsername,
+          displayName: cleanDisplayName,
+          email: '',
+          phone: cleanPhone,
+          position: cleanPosition,
           role: addForm.role,
           status: addForm.status,
-        },
-      });
-      showToast(`Pengguna ${addForm.username} berhasil ditambahkan.`, 'success');
+          createdAt: now,
+          updatedAt: now,
+          createdBy: appUser.uid,
+          updatedBy: appUser.uid,
+        };
+        await cacheOfflineAuthCredential(cleanUsername, addForm.password, localUser);
+        const nextList = [...users, localUser];
+        await setOfflineKV('users', nextList);
+      }
+
+      showToast(`Pengguna ${cleanUsername} berhasil ditambahkan.`, 'success');
       setShowAddModal(false);
       setAddForm({
         username: '',
@@ -206,19 +269,53 @@ export function UsersManagementPage() {
       return;
     }
 
+    const cleanPhone = sanitizeString(editForm.phone, BLUEPRINT_LIMITS.user.phoneMax);
+    const cleanPosition = sanitizeString(editForm.position, BLUEPRINT_LIMITS.user.positionMax);
+
     setSavingEdit(true);
     try {
-      await apiRequest(`/api/users/${editingUser.uid}`, {
-        method: 'PATCH',
-        body: {
-          displayName: cleanName,
-          phone: sanitizeString(editForm.phone, BLUEPRINT_LIMITS.user.phoneMax),
-          position: sanitizeString(editForm.position, BLUEPRINT_LIMITS.user.positionMax),
-          role: editForm.role,
-          status: editForm.status,
-          newPassword: editForm.newPassword || undefined,
-        },
-      });
+      if (useServerApi) {
+        await apiRequest(`/api/users/${editingUser.uid}`, {
+          method: 'PATCH',
+          body: {
+            displayName: cleanName,
+            phone: cleanPhone,
+            position: cleanPosition,
+            role: editForm.role,
+            status: editForm.status,
+            newPassword: editForm.newPassword || undefined,
+          },
+        });
+      } else {
+        await updateOfflineAuthUserMetadata(
+          editingUser.uid,
+          {
+            displayName: cleanName,
+            phone: cleanPhone,
+            position: cleanPosition,
+            role: editForm.role,
+            status: editForm.status,
+            updatedBy: appUser.uid,
+          },
+          editForm.newPassword || undefined
+        );
+        const nextList = users.map((u) =>
+          u.uid === editingUser.uid
+            ? {
+                ...u,
+                displayName: cleanName,
+                phone: cleanPhone,
+                position: cleanPosition,
+                role: editForm.role,
+                status: editForm.status,
+                updatedAt: new Date().toISOString(),
+                updatedBy: appUser.uid,
+              }
+            : u
+        );
+        await setOfflineKV('users', nextList);
+      }
+
       showToast(`Data pengguna ${cleanName} berhasil diperbarui.`, 'success');
       setEditingUser(null);
       await loadUsers();
@@ -230,18 +327,31 @@ export function UsersManagementPage() {
   };
 
   const handleQuickActivate = async (user: AppUser) => {
-    if (!canMutate) return;
+    if (!canMutate || !appUser) return;
     try {
-      await apiRequest(`/api/users/${user.uid}`, {
-        method: 'PATCH',
-        body: {
-          displayName: user.displayName,
-          phone: user.phone || '',
-          position: user.position || '',
-          role: user.role,
+      if (useServerApi) {
+        await apiRequest(`/api/users/${user.uid}`, {
+          method: 'PATCH',
+          body: {
+            displayName: user.displayName,
+            phone: user.phone || '',
+            position: user.position || '',
+            role: user.role,
+            status: 'active',
+          },
+        });
+      } else {
+        await updateOfflineAuthUserMetadata(user.uid, {
           status: 'active',
-        },
-      });
+          updatedBy: appUser.uid,
+        });
+        const nextList = users.map((u) =>
+          u.uid === user.uid
+            ? { ...u, status: 'active' as UserStatus, updatedAt: new Date().toISOString() }
+            : u
+        );
+        await setOfflineKV('users', nextList);
+      }
       showToast(`Akun ${user.displayName} telah diaktifkan.`, 'success');
       await loadUsers();
     } catch (err) {
@@ -253,9 +363,15 @@ export function UsersManagementPage() {
     if (!deletingUser || !canMutate) return;
     setDeleting(true);
     try {
-      await apiRequest(`/api/users/${deletingUser.uid}`, {
-        method: 'DELETE',
-      });
+      if (useServerApi) {
+        await apiRequest(`/api/users/${deletingUser.uid}`, {
+          method: 'DELETE',
+        });
+      } else {
+        await deleteOfflineAuthUser(deletingUser.uid);
+        const nextList = users.filter((u) => u.uid !== deletingUser.uid);
+        await setOfflineKV('users', nextList);
+      }
       showToast(`Pengguna ${deletingUser.displayName} berhasil dihapus.`, 'success');
       setDeletingUser(null);
       await loadUsers();
@@ -305,11 +421,11 @@ export function UsersManagementPage() {
           </div>
         </div>
 
-        {!canMutate && (
+        {!useServerApi && (
           <div className="mt-4 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900">
             <WifiOff className="h-4 w-4 shrink-0 text-[#D97706]" />
             <span>
-              Anda sedang berada dalam sesi offline. Daftar pengguna ditampilkan dari cache lokal; penambahan atau perubahan akun memerlukan koneksi internet.
+              Mode penyimpanan lokal/offline aktif. Perubahan aktivasi, peran, dan akun pengguna disimpan pada perangkat ini.
             </span>
           </div>
         )}

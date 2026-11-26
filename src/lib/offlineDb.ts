@@ -162,6 +162,90 @@ export async function hasAnyOfflineAccount(): Promise<boolean> {
   });
 }
 
+export async function getAllOfflineUsers(): Promise<AppUser[]> {
+  if (typeof indexedDB === 'undefined') return [];
+  const db = await openOfflineDb();
+  return new Promise<AppUser[]>((resolve, reject) => {
+    const tx = db.transaction('offlineAuth', 'readonly');
+    const req = tx.objectStore('offlineAuth').getAll();
+    req.onsuccess = () => {
+      const rows = (req.result as OfflineAuthRecord[]) || [];
+      resolve(rows.map((r) => r.user));
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function updateOfflineAuthUserMetadata(
+  uid: string,
+  updates: Partial<AppUser>,
+  newPassword?: string
+): Promise<AppUser | null> {
+  if (typeof indexedDB === 'undefined') return null;
+  const db = await openOfflineDb();
+  const rows = await new Promise<OfflineAuthRecord[]>((resolve, reject) => {
+    const tx = db.transaction('offlineAuth', 'readonly');
+    const req = tx.objectStore('offlineAuth').getAll();
+    req.onsuccess = () => resolve((req.result as OfflineAuthRecord[]) || []);
+    req.onerror = () => reject(req.error);
+  });
+
+  const target = rows.find((r) => r.user.uid === uid);
+  if (!target) return null;
+
+  let saltHex = target.saltHex;
+  let hashHex = target.hashHex;
+  if (newPassword && newPassword.length >= 6 && crypto?.subtle) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    saltHex = toHex(salt);
+    hashHex = await derivePbkdf2(newPassword, salt);
+  }
+
+  const nextUser: AppUser = {
+    ...target.user,
+    ...updates,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const nextRecord: OfflineAuthRecord = {
+    ...target,
+    saltHex,
+    hashHex,
+    user: nextUser,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('offlineAuth', 'readwrite');
+    tx.objectStore('offlineAuth').put(nextRecord);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  return nextUser;
+}
+
+export async function deleteOfflineAuthUser(uid: string): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const db = await openOfflineDb();
+  const rows = await new Promise<OfflineAuthRecord[]>((resolve, reject) => {
+    const tx = db.transaction('offlineAuth', 'readonly');
+    const req = tx.objectStore('offlineAuth').getAll();
+    req.onsuccess = () => resolve((req.result as OfflineAuthRecord[]) || []);
+    req.onerror = () => reject(req.error);
+  });
+
+  const target = rows.find((r) => r.user.uid === uid);
+  if (!target) return;
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('offlineAuth', 'readwrite');
+    tx.objectStore('offlineAuth').delete(target.usernameKey);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 export async function setOfflineKV<T>(key: string, value: T): Promise<void> {
   if (typeof indexedDB === 'undefined') return;
   const db = await openOfflineDb();
