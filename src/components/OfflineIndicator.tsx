@@ -7,6 +7,7 @@ export function OfflineIndicator() {
   const isOnline = useOnlineStatus();
   const {
     isOfflineSession,
+    serverApiAvailable,
     pendingSyncCount,
     pendingFirestoreCount,
     syncing,
@@ -53,6 +54,35 @@ export function OfflineIndicator() {
   };
 
   if (isOfflineSession) {
+    if (!serverApiAvailable) {
+      if (totalPending === 0) {
+        return null;
+      }
+      return (
+        <div
+          role="status"
+          className="fixed bottom-4 left-4 z-50 flex flex-wrap items-center gap-2.5 rounded-lg border border-emerald-300 bg-emerald-50 px-3.5 py-2 text-xs font-medium text-emerald-950 shadow-sm"
+        >
+          <Cloud className="h-4 w-4 shrink-0 text-[#0F3D2E]" />
+          <span>
+            Internet terhubung ({totalPending} perubahan siap disinkronkan ke Cloud Firestore).
+          </span>
+          <button
+            type="button"
+            onClick={firestoreConnected ? handleSyncClick : openCloudSyncModal}
+            disabled={syncing || firestoreSyncing}
+            className="rounded bg-[#0F3D2E] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#144D3A] disabled:opacity-60"
+          >
+            {firestoreConnected
+              ? firestoreSyncing
+                ? 'Menyinkronkan...'
+                : 'Sinkronkan ke Firestore'
+              : 'Hubungkan Cloud Firestore'}
+          </button>
+        </div>
+      );
+    }
+
     return (
       <div
         role="status"

@@ -106,6 +106,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
     appUser,
     institution,
     isOfflineSession,
+    serverApiAvailable,
     pendingSyncCount,
     syncing,
     syncNow,
@@ -125,14 +126,14 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const handleManualSync = async () => {
     const res = await syncNow();
     if (res.lastError) {
-      if (isOnline && isOfflineSession) {
+      if (isOnline && (isOfflineSession || !serverApiAvailable)) {
         return;
       }
       showToast(res.lastError, 'error');
     } else if (res.syncedCount > 0) {
-      showToast(`${res.syncedCount} perubahan berhasil disinkronkan ke server.`, 'success');
-    } else if (isOnline && !isOfflineSession) {
-      showToast('Semua data sudah tersinkronisasi dengan server.', 'success');
+      showToast(`${res.syncedCount} perubahan berhasil disinkronkan.`, 'success');
+    } else if (isOnline && (!isOfflineSession || !serverApiAvailable)) {
+      showToast('Semua data sudah tersinkronisasi.', 'success');
     }
   };
 
@@ -318,7 +319,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
                 <span className="sm:hidden">{pendingSyncCount}</span>
               </button>
             )}
-            {isOnline && isOfflineSession && pendingSyncCount === 0 && (
+            {isOnline && isOfflineSession && serverApiAvailable && pendingSyncCount === 0 && (
               <button
                 type="button"
                 onClick={openReconnectModal}

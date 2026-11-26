@@ -37,6 +37,8 @@ export function CloudSyncModal() {
     lastFirestoreSyncError,
     pendingSyncCount,
     syncing,
+    serverApiAvailable,
+    hasServerSession,
     connectFirestoreCloud,
     disconnectFirestoreCloud,
     syncFirestoreNow,
@@ -80,7 +82,7 @@ export function CloudSyncModal() {
   const handleSyncQueue = async () => {
     setBusyAction('sync');
     try {
-      if (pendingSyncCount > 0) {
+      if (pendingSyncCount > 0 && serverApiAvailable && hasServerSession) {
         await syncNow();
       }
       const res = await syncFirestoreNow();

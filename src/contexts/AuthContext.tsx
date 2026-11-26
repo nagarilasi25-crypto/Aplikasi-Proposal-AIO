@@ -258,6 +258,8 @@ interface AuthContextValue {
   needsSetup: boolean;
   hasEnvAdminPasscode: boolean;
   isOfflineSession: boolean;
+  serverApiAvailable: boolean;
+  hasServerSession: boolean;
   pendingSyncCount: number;
   syncing: boolean;
   lastSyncError: string | null;
@@ -421,6 +423,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [needsSetup, setNeedsSetup] = useState(false);
   const [hasEnvAdminPasscode, setHasEnvAdminPasscode] = useState(false);
   const [isOfflineSession, setIsOfflineSession] = useState(false);
+  const [serverApiAvailable, setServerApiAvailable] = useState(true);
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const [syncing, setSyncing] = useState(false);
   const [lastSyncError, setLastSyncError] = useState<string | null>(null);
@@ -471,6 +474,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         } catch {
           serverReachable = false;
         }
+        setServerApiAvailable(serverReachable);
       }
 
       if (!serverReachable) {
@@ -1798,8 +1802,39 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const syncFirestoreNow = useCallback(async () => {
     await resetFailedFirestoreItems();
-    return flushFirestoreNow();
-  }, [flushFirestoreNow]);
+    const existingFs = await getFirestoreSyncQueue();
+    const existingApi = await getOfflineMutationQueue();
+    if (existingFs.length === 0 && existingApi.length > 0) {
+      await enqueueFullSnapshotToFirestore({
+        institution,
+        categories,
+        templates,
+        proposals,
+        budgets,
+        attachments,
+        statusHistory,
+      });
+      await refreshQueueCount();
+    }
+    const res = await flushFirestoreNow();
+    if (res.failedCount === 0 && !serverApiAvailable) {
+      await clearOfflineMutationQueue();
+      setLastSyncError(null);
+      await refreshQueueCount();
+    }
+    return res;
+  }, [
+    attachments,
+    budgets,
+    categories,
+    flushFirestoreNow,
+    institution,
+    proposals,
+    refreshQueueCount,
+    serverApiAvailable,
+    statusHistory,
+    templates,
+  ]);
 
   const retryFailedFirestoreSync = useCallback(async () => {
     await resetFailedFirestoreItems();
@@ -1818,6 +1853,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     await refreshQueueCount();
     const res = await flushFirestoreNow();
+    if (res.failedCount === 0 && !serverApiAvailable) {
+      await clearOfflineMutationQueue();
+      setLastSyncError(null);
+      await refreshQueueCount();
+    }
     return {
       enqueuedCount,
       ...res,
@@ -1830,6 +1870,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     institution,
     proposals,
     refreshQueueCount,
+    serverApiAvailable,
     statusHistory,
     templates,
   ]);
@@ -1841,8 +1882,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const user = await signInFirebaseWithGoogle();
     setFirebaseUser(user);
 
-    const existingQueue = await getFirestoreSyncQueue();
-    if (existingQueue.length === 0) {
+    const [existingQueue, existingApiQueue] = await Promise.all([
+      getFirestoreSyncQueue(),
+      getOfflineMutationQueue(),
+    ]);
+    if (existingQueue.length === 0 || existingApiQueue.length > 0) {
       await enqueueFullSnapshotToFirestore({
         institution,
         categories,
@@ -1862,6 +1906,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         onQueueChange: setFirestoreQueue,
       });
       setLastFirestoreSyncError(res.lastError);
+      if (res.failedCount === 0 && !serverApiAvailable) {
+        await clearOfflineMutationQueue();
+        setLastSyncError(null);
+        await refreshQueueCount();
+      }
       return res;
     } finally {
       setFirestoreQueue(await getFirestoreSyncQueue());
@@ -1874,6 +1923,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     institution,
     proposals,
     refreshQueueCount,
+    serverApiAvailable,
     statusHistory,
     templates,
   ]);
@@ -1896,6 +1946,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         lastError: 'Perangkat masih offline. Hubungkan ke internet terlebih dahulu.',
       };
     }
+
+    if (!serverApiAvailable) {
+      if (!firestoreConnected) {
+        setCloudSyncModalOpen(true);
+        return {
+          syncedCount: 0,
+          failedCount: 0,
+          lastError: 'Hubungkan akun Google Firestore untuk menyinkronkan perubahan lokal secara online.',
+        };
+      }
+      return syncFirestoreNow();
+    }
+
     if (!sessionToken) {
       setReconnectModalOpen(true);
       return {
@@ -1909,7 +1972,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       await flushFirestoreNow();
     }
     return serverRes;
-  }, [firestoreConnected, flushFirestoreNow, flushQueueWithToken, sessionToken]);
+  }, [
+    firestoreConnected,
+    flushFirestoreNow,
+    flushQueueWithToken,
+    serverApiAvailable,
+    sessionToken,
+    syncFirestoreNow,
+  ]);
 
   const reconnectServerSession = useCallback(
     async (
@@ -1952,10 +2022,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         loginErrText.toLowerCase().includes('page could not be found');
 
       if (isServerEndpointMissing) {
+        setServerApiAvailable(false);
         throw new Error(
           'Server backend (/api) belum merespons atau tidak tersedia pada alamat ini. Data Anda tetap tersimpan lokal; gunakan Sinkronisasi Cloud Firestore untuk mencadangkan data secara online.'
         );
       }
+      setServerApiAvailable(true);
 
       let activeToken = loginParsed.data?.token;
       let activeUser = loginParsed.data?.user;
@@ -3032,6 +3104,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         needsSetup,
         hasEnvAdminPasscode,
         isOfflineSession,
+        serverApiAvailable,
+        hasServerSession: Boolean(sessionToken),
         pendingSyncCount,
         syncing,
         lastSyncError,

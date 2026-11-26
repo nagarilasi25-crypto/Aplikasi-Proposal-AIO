@@ -271,8 +271,27 @@ export function buildStatusHistoryFirestorePayload(
 export async function signInFirebaseWithGoogle(): Promise<FirebaseUser> {
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: 'select_account' });
-  const result = await signInWithPopup(auth, provider);
-  const user = result.user;
+  let user: FirebaseUser;
+  try {
+    const result = await signInWithPopup(auth, provider);
+    user = result.user;
+  } catch (err) {
+    const code = (err as { code?: string })?.code || '';
+    if (code === 'auth/popup-blocked') {
+      throw new Error(
+        'Jendela login Google diblokir oleh peramban. Izinkan pop-up untuk situs ini lalu coba lagi.'
+      );
+    }
+    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+      throw new Error('Login Google dibatalkan sebelum selesai.');
+    }
+    if (code === 'auth/unauthorized-domain') {
+      throw new Error(
+        'Domain ini belum terdaftar di Authorized Domains Firebase Authentication.'
+      );
+    }
+    throw err;
+  }
 
   if (!user.emailVerified) {
     throw new Error('Akun Google belum terverifikasi emailnya.');
