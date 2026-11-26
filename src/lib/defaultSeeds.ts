@@ -1,10 +1,10 @@
-import {
+import type {
   ProposalCategory,
   ProposalSectionContent,
   ProposalTemplate,
   SystemAppSettings,
   TemplateSection,
-} from '../types/models';
+} from '../types/models.ts';
 
 export const DEFAULT_APP_SETTINGS: SystemAppSettings = {
   numberPrefix: 'PROP/RQ-AR',

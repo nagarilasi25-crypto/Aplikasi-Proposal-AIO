@@ -267,7 +267,8 @@ interface AuthContextValue {
   syncNow: () => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
   clearPendingQueue: () => Promise<void>;
   reconnectServerSession: (
-    password: string
+    password: string,
+    options?: { approverUsername?: string; approverPassword?: string }
   ) => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
   firebaseUser: FirebaseUser | null;
   firestoreConnected: boolean;
@@ -667,12 +668,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
 
       const parsed = await parseJsonResponse<T & { error?: unknown }>(res);
-      if (!parsed.isJson || res.status >= 500) {
+      const rawErrText = extractErrorMessage(parsed.data, '');
+      const isProxyNotFound =
+        res.status === 404 && rawErrText.toLowerCase().includes('page could not be found');
+      if (!parsed.isJson || res.status >= 500 || isProxyNotFound) {
         throw new RecoverableTransportError(
-          extractErrorMessage(
-            parsed.data,
-            'Layanan server tidak merespons dengan benar. Coba beberapa saat lagi.'
-          )
+          isProxyNotFound
+            ? 'Layanan server backend (/api) tidak tersedia pada alamat pratinjau ini.'
+            : extractErrorMessage(
+                parsed.data,
+                'Layanan server tidak merespons dengan benar. Coba beberapa saat lagi.'
+              )
         );
       }
       if (res.status === 401) {
@@ -1907,7 +1913,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const reconnectServerSession = useCallback(
     async (
-      password: string
+      password: string,
+      options?: { approverUsername?: string; approverPassword?: string }
     ): Promise<{ syncedCount: number; failedCount: number; lastError: string | null }> => {
       if (!appUser) {
         throw new Error('Tidak ada akun aktif yang dapat dihubungkan.');
@@ -1937,17 +1944,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         error?: unknown;
       }>(loginRes);
 
-      if (!loginParsed.isJson || loginRes.status >= 500) {
-        throw new Error('Server belum merespons. Periksa koneksi internet dan coba lagi.');
+      const loginErrText = extractErrorMessage(loginParsed.data, '');
+      const isServerEndpointMissing =
+        !loginParsed.isJson ||
+        loginRes.status === 404 ||
+        loginRes.status >= 500 ||
+        loginErrText.toLowerCase().includes('page could not be found');
+
+      if (isServerEndpointMissing) {
+        throw new Error(
+          'Server backend (/api) belum merespons atau tidak tersedia pada alamat ini. Data Anda tetap tersimpan lokal; gunakan Sinkronisasi Cloud Firestore untuk mencadangkan data secara online.'
+        );
       }
 
       let activeToken = loginParsed.data?.token;
       let activeUser = loginParsed.data?.user;
       let activeInst = loginParsed.data?.institution;
+      let registrationErrorMsg: string | null = null;
 
       // If this account was created locally offline and doesn't exist on server yet
       if ((!loginParsed.ok || !activeToken || !activeUser) && appUser.uid.startsWith('local_')) {
         const bootRes = await fetch('/api/auth/bootstrap-status', {
+          cache: 'no-store',
           headers: { Accept: 'application/json' },
         });
         const bootParsed = await parseJsonResponse<{ needsSetup?: boolean }>(bootRes);
@@ -1975,8 +1993,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             activeToken = setupParsed.data.token;
             activeUser = setupParsed.data.user;
             activeInst = setupParsed.data.institution;
+          } else if (!setupParsed.ok) {
+            registrationErrorMsg = extractErrorMessage(
+              setupParsed.data,
+              'Gagal mendaftarkan akun Administrator ke server.'
+            );
           }
-        } else if (loginRes.status === 401 || loginRes.status === 404) {
+        } else if (loginRes.status === 401) {
           const regRes = await fetch('/api/auth/register', {
             method: 'POST',
             headers: {
@@ -1988,22 +2011,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               displayName: appUser.displayName || username,
               password,
               role: appUser.role,
+              approverUsername: options?.approverUsername?.trim() || undefined,
+              approverPassword: options?.approverPassword || undefined,
             }),
           });
           const regParsed = await parseJsonResponse<{
+            autoActivated?: boolean;
             token?: string;
             user?: AppUser;
             institution?: InstitutionProfile;
-            pending?: boolean;
             error?: unknown;
           }>(regRes);
           if (regParsed.ok && regParsed.data?.token && regParsed.data?.user) {
             activeToken = regParsed.data.token;
             activeUser = regParsed.data.user;
             activeInst = regParsed.data.institution;
-          } else if (regParsed.data?.pending) {
+          } else if (regParsed.ok && regParsed.data?.autoActivated === false) {
             throw new Error(
-              'Akun lokal telah dikirim ke server dan menunggu aktivasi oleh Administrator.'
+              'Akun lokal telah dikirim ke server dan menunggu aktivasi oleh Administrator server.'
+            );
+          } else if (regRes.status === 403 && appUser.role === 'Administrator') {
+            throw new Error(
+              'NEEDS_APPROVER:Server sudah memiliki Administrator aktif. Masukkan kredensial Administrator server yang sudah aktif (atau Kode Akses Server) untuk menyetujui akun lokal ini.'
+            );
+          } else if (regRes.status === 409) {
+            registrationErrorMsg =
+              'Nama pengguna tersebut sudah terdaftar di server dengan kata sandi berbeda. Masukkan kata sandi akun server yang sesuai.';
+          } else if (!regParsed.ok) {
+            registrationErrorMsg = extractErrorMessage(
+              regParsed.data,
+              'Gagal menyambungkan akun lokal ke server.'
             );
           }
         }
@@ -2011,10 +2048,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       if (!activeToken || !activeUser) {
         throw new Error(
-          extractErrorMessage(
-            loginParsed.data,
-            'Kata sandi tidak sesuai atau akun belum terdaftar di server.'
-          )
+          registrationErrorMsg ||
+            extractErrorMessage(
+              loginParsed.data,
+              'Kata sandi tidak sesuai atau akun belum terdaftar di server.'
+            )
         );
       }
 

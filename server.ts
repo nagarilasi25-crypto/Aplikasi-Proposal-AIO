@@ -3,13 +3,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import express, { NextFunction, Request, Response } from 'express';
+import express from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   createInitialCategories,
   createInitialTemplates,
   DEFAULT_APP_SETTINGS,
-} from './src/lib/defaultSeeds';
+} from './src/lib/defaultSeeds.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(process.cwd(), 'data');
