@@ -12,16 +12,31 @@ import {
 } from './src/lib/defaultSeeds';
 
 const PORT = Number(process.env.PORT) || 3000;
-const SESSION_SECRET =
-  process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 16
-    ? process.env.SESSION_SECRET
-    : crypto.randomBytes(32).toString('hex');
-const ENV_ADMIN_PASSCODE = (process.env.ADMIN_PASSCODE || '').trim();
-const TOKEN_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
-
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const UPLOADS_DIR = path.resolve(DATA_DIR, 'uploads');
 const STORE_FILE = path.join(DATA_DIR, 'arraudhah-store.json');
+const SESSION_SECRET_FILE = path.join(DATA_DIR, '.session-secret');
+
+function loadOrCreateSessionSecret(): string {
+  const envSecret = (process.env.SESSION_SECRET || '').trim();
+  if (envSecret.length >= 16) return envSecret;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (fs.existsSync(SESSION_SECRET_FILE)) {
+      const saved = fs.readFileSync(SESSION_SECRET_FILE, 'utf8').trim();
+      if (saved.length >= 32) return saved;
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(SESSION_SECRET_FILE, generated, { encoding: 'utf8', mode: 0o600 });
+    return generated;
+  } catch {
+    return crypto.randomBytes(32).toString('hex');
+  }
+}
+
+const SESSION_SECRET = loadOrCreateSessionSecret();
+const ENV_ADMIN_PASSCODE = (process.env.ADMIN_PASSCODE || '').trim();
+const TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
 
 type UserRole = 'Administrator' | 'Pimpinan' | 'Operator';
 type UserStatus = 'active' | 'pending' | 'inactive';
@@ -474,8 +489,19 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
     };
   }
 
-  if (!user || user.status !== 'active') {
-    res.status(403).json({ error: 'Akun Anda belum aktif atau telah dinonaktifkan.' });
+  if (!user) {
+    res.status(401).json({
+      code: 'USER_NOT_FOUND',
+      error: 'Akun tidak ditemukan pada sesi server. Silakan hubungkan kembali sesi Anda.',
+    });
+    return;
+  }
+
+  if (user.status !== 'active') {
+    res.status(403).json({
+      code: user.status === 'pending' ? 'ACCOUNT_PENDING' : 'ACCOUNT_INACTIVE',
+      error: 'Akun Anda belum aktif atau telah dinonaktifkan.',
+    });
     return;
   }
 
@@ -1755,17 +1781,29 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
     const code = sanitizeStr(req.body?.code, 12).toUpperCase();
     const description = sanitizeStr(req.body?.description, 500);
     const store = readStore();
-    const duplicate = store.proposalCategories.some(
+    const reqId = sanitizeStr(req.body?.id, 80);
+    if (reqId) {
+      const existingById = store.proposalCategories.find((c) => c.id === reqId);
+      if (existingById) {
+        res.status(200).json({ category: existingById });
+        return;
+      }
+    }
+    const existingByName = store.proposalCategories.find(
       (c) => String(c.name || '').trim().toLowerCase() === name.toLowerCase()
     );
-    if (duplicate) {
+    if (existingByName) {
+      if (reqId) {
+        res.status(200).json({ category: existingByName });
+        return;
+      }
       res.status(409).json({ error: 'Nama kategori tersebut sudah ada.' });
       return;
     }
 
     const now = new Date().toISOString();
     const category = {
-      id: sanitizeStr(req.body?.id, 80) || `cat_${crypto.randomUUID()}`,
+      id: reqId || `cat_${crypto.randomUUID()}`,
       institutionId: 'ar-raudhah',
       name,
       code: code || name.slice(0, 3).toUpperCase(),
@@ -1899,6 +1937,14 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
     };
 
     const store = readStore();
+    const reqTplId = sanitizeStr(req.body?.id, 80);
+    if (reqTplId) {
+      const existingTpl = store.proposalTemplates.find((t) => t.id === reqTplId);
+      if (existingTpl) {
+        res.status(200).json({ template: existingTpl });
+        return;
+      }
+    }
     store.proposalTemplates.push(template);
     appendAudit(store, {
       action: 'TEMPLATE_CREATE',
@@ -2068,6 +2114,11 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
     const store = readStore();
     const now = new Date().toISOString();
     const proposalId = sanitizeStr(body.id, 80) || `prop_${crypto.randomUUID()}`;
+    const existingProp = store.proposals.find((p) => p.id === proposalId);
+    if (existingProp) {
+      res.status(200).json({ proposal: existingProp });
+      return;
+    }
     const rawSections = Array.isArray(body.sections) ? body.sections : [];
     const sections = rawSections.map((sec: Record<string, unknown>, i: number) => ({
       id: sanitizeStr(sec.id, 80) || `sec_${i + 1}`,

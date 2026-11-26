@@ -1,10 +1,12 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import {
   AiNarrativeRequest,
   AiNarrativeResponse,
   AppUser,
   AuditLogRecord,
   DEFAULT_INSTITUTION_SEED,
+  INSTITUTION_DOC_ID,
   InstitutionProfile,
   ProposalAttachment,
   ProposalBudget,
@@ -25,20 +27,140 @@ import {
   cacheDashboardSnapshot,
   cacheOfflineAuthCredential,
   clearAllOfflineAuthAccounts,
+  clearFirestoreSyncQueue,
+  clearOfflineMutationQueue,
   enqueueOfflineMutation,
+  FirestoreSyncItem,
+  getAllOfflineUsers,
+  getFirestoreSyncQueue,
   getOfflineKV,
   getOfflineMutationQueue,
   hasActiveOfflineAdmin,
   hasOfflineUsername,
   recoverOfflineUsername,
   removeOfflineMutation,
+  resetFailedFirestoreItems,
   resetOfflineAccount,
   setOfflineKV,
   updateOfflineAuthUserMetadata,
   verifyActiveOfflineAdmin,
   verifyOfflineAuthCredentialDetailed,
 } from '../lib/offlineDb';
+import { auth, testConnection } from '../lib/firebase';
+import {
+  buildArchiveFirestorePayload,
+  buildAttachmentFirestorePayload,
+  buildBudgetFirestorePayload,
+  buildCategoryFirestorePayload,
+  buildInstitutionFirestorePayload,
+  buildProposalFirestorePayload,
+  buildStatusHistoryFirestorePayload,
+  buildTemplateFirestorePayload,
+  enqueueEntityToFirestore,
+  enqueueFullSnapshotToFirestore,
+  processFirestoreSyncQueue,
+  signInFirebaseWithGoogle,
+  signOutFirebase,
+} from '../lib/firestoreSync';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
+
+const SESSION_STORAGE_KEY = 'arraudhah_session_v1';
+
+interface StoredSessionData {
+  token: string | null;
+  user: AppUser;
+  isOfflineSession?: boolean;
+  savedAt?: string;
+}
+
+function isValidStoredSessionPayload(parsed: unknown): parsed is StoredSessionData {
+  if (!parsed || typeof parsed !== 'object') return false;
+  const candidate = parsed as Partial<StoredSessionData>;
+  const validToken = candidate.token === null || typeof candidate.token === 'string';
+  return Boolean(
+    validToken &&
+      candidate.user &&
+      typeof candidate.user.uid === 'string' &&
+      candidate.user.uid.length > 0 &&
+      candidate.user.status === 'active'
+  );
+}
+
+function saveStoredSession(
+  token: string | null,
+  user: AppUser,
+  isOfflineSession = !token
+) {
+  const payload: StoredSessionData = {
+    token,
+    user,
+    isOfflineSession,
+    savedAt: new Date().toISOString(),
+  };
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage quota errors
+  }
+  void setOfflineKV('activeSession', payload);
+  void setOfflineKV('swSyncToken', token);
+}
+
+function readStoredSession(): StoredSessionData | null {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (isValidStoredSessionPayload(parsed)) {
+      return {
+        token: parsed.token || null,
+        user: parsed.user,
+        isOfflineSession: Boolean(parsed.isOfflineSession || !parsed.token),
+        savedAt: parsed.savedAt,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function readStoredSessionAsync(): Promise<StoredSessionData | null> {
+  const fromLocal = readStoredSession();
+  if (fromLocal) {
+    return fromLocal;
+  }
+  try {
+    const fromIdb = await getOfflineKV<StoredSessionData>('activeSession');
+    if (isValidStoredSessionPayload(fromIdb)) {
+      const normalized: StoredSessionData = {
+        token: fromIdb.token || null,
+        user: fromIdb.user,
+        isOfflineSession: Boolean(fromIdb.isOfflineSession || !fromIdb.token),
+        savedAt: fromIdb.savedAt,
+      };
+      try {
+        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(normalized));
+      } catch {
+        // Ignore storage quota errors
+      }
+      return normalized;
+    }
+  } catch {
+    // Ignore IndexedDB read errors
+  }
+  return null;
+}
+
+function clearStoredSession() {
+  try {
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // Ignore
+  }
+  void setOfflineKV('activeSession', null);
+  void setOfflineKV('swSyncToken', null);
+}
 
 interface ParsedApiResponse<T> {
   ok: boolean;
@@ -51,6 +173,22 @@ class RecoverableTransportError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'RecoverableTransportError';
+  }
+}
+
+class AuthSessionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthSessionError';
+  }
+}
+
+class HttpClientError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'HttpClientError';
+    this.status = status;
   }
 }
 
@@ -121,6 +259,31 @@ interface AuthContextValue {
   hasEnvAdminPasscode: boolean;
   isOfflineSession: boolean;
   pendingSyncCount: number;
+  syncing: boolean;
+  lastSyncError: string | null;
+  reconnectModalOpen: boolean;
+  openReconnectModal: () => void;
+  closeReconnectModal: () => void;
+  syncNow: () => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
+  clearPendingQueue: () => Promise<void>;
+  reconnectServerSession: (
+    password: string
+  ) => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
+  firebaseUser: FirebaseUser | null;
+  firestoreConnected: boolean;
+  firestoreQueue: FirestoreSyncItem[];
+  pendingFirestoreCount: number;
+  firestoreSyncing: boolean;
+  lastFirestoreSyncError: string | null;
+  cloudSyncModalOpen: boolean;
+  openCloudSyncModal: () => void;
+  closeCloudSyncModal: () => void;
+  connectFirestoreCloud: () => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
+  disconnectFirestoreCloud: () => Promise<void>;
+  syncFirestoreNow: () => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
+  pushAllLocalToFirestore: () => Promise<{ enqueuedCount: number; syncedCount: number; failedCount: number; lastError: string | null }>;
+  clearFirestoreQueue: () => Promise<void>;
+  retryFailedFirestoreSync: () => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
   pendingStatusUser: AppUser | null;
   authError: string | null;
   authNotice: string | null;
@@ -258,37 +421,164 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [hasEnvAdminPasscode, setHasEnvAdminPasscode] = useState(false);
   const [isOfflineSession, setIsOfflineSession] = useState(false);
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
+  const [syncing, setSyncing] = useState(false);
+  const [lastSyncError, setLastSyncError] = useState<string | null>(null);
+  const [reconnectModalOpen, setReconnectModalOpen] = useState(false);
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [firestoreQueue, setFirestoreQueue] = useState<FirestoreSyncItem[]>([]);
+  const [firestoreSyncing, setFirestoreSyncing] = useState(false);
+  const [lastFirestoreSyncError, setLastFirestoreSyncError] = useState<string | null>(null);
+  const [cloudSyncModalOpen, setCloudSyncModalOpen] = useState(false);
   const [pendingStatusUser, setPendingStatusUser] = useState<AppUser | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authNotice, setAuthNotice] = useState<string | null>(null);
+  const syncInFlightRef = useRef(false);
+
+  const firestoreConnected = Boolean(firebaseUser && firebaseUser.emailVerified);
+  const pendingFirestoreCount = firestoreQueue.length;
 
   const refreshQueueCount = useCallback(async () => {
-    const queue = await getOfflineMutationQueue();
+    const [queue, fsQueue] = await Promise.all([
+      getOfflineMutationQueue(),
+      getFirestoreSyncQueue(),
+    ]);
     setPendingSyncCount(queue.length);
+    setFirestoreQueue(fsQueue);
   }, []);
 
   const checkBootstrapStatus = useCallback(async () => {
     setAuthLoading(true);
     try {
-      const res = await fetch('/api/auth/bootstrap-status', {
-        headers: { Accept: 'application/json' },
-      });
-      const parsed = await parseJsonResponse<{
-        needsSetup?: boolean;
-        hasEnvAdminPasscode?: boolean;
-      }>(res);
-      if (parsed.ok && parsed.isJson && typeof parsed.data?.needsSetup === 'boolean') {
-        setNeedsSetup(parsed.data.needsSetup);
-        setHasEnvAdminPasscode(Boolean(parsed.data.hasEnvAdminPasscode));
-        return;
+      const stored = await readStoredSessionAsync();
+      let serverReachable = false;
+
+      if (navigator.onLine) {
+        try {
+          const bootRes = await fetch('/api/auth/bootstrap-status', {
+            cache: 'no-store',
+            headers: { Accept: 'application/json' },
+          });
+          const parsed = await parseJsonResponse<{
+            needsSetup?: boolean;
+            hasEnvAdminPasscode?: boolean;
+          }>(bootRes);
+          if (parsed.ok && parsed.isJson && typeof parsed.data?.needsSetup === 'boolean') {
+            serverReachable = true;
+            setNeedsSetup(parsed.data.needsSetup);
+            setHasEnvAdminPasscode(Boolean(parsed.data.hasEnvAdminPasscode));
+          }
+        } catch {
+          serverReachable = false;
+        }
       }
-      const hasLocalAdmin = await hasActiveOfflineAdmin();
-      setNeedsSetup(!hasLocalAdmin);
-      setHasEnvAdminPasscode(false);
-    } catch {
-      const hasLocalAdmin = await hasActiveOfflineAdmin();
-      setNeedsSetup(!hasLocalAdmin);
-      setHasEnvAdminPasscode(false);
+
+      if (!serverReachable) {
+        const hasLocalAdmin = await hasActiveOfflineAdmin();
+        setNeedsSetup(!hasLocalAdmin);
+        setHasEnvAdminPasscode(false);
+      }
+
+      if (stored && stored.user) {
+        const resolveRestoredUser = async (): Promise<AppUser | null> => {
+          try {
+            const cachedUsers = await getAllOfflineUsers();
+            const offlineMatch = cachedUsers.find(
+              (u) =>
+                u.status === 'active' &&
+                (u.uid === stored.user.uid ||
+                  (u.username || '').toLowerCase() ===
+                    (stored.user.username || '').toLowerCase())
+            );
+            if (offlineMatch) return offlineMatch;
+          } catch {
+            // Fall back to stored user object
+          }
+          return stored.user.status === 'active' ? stored.user : null;
+        };
+
+        if (stored.token && serverReachable) {
+          try {
+            const meRes = await fetch('/api/auth/me', {
+              cache: 'no-store',
+              headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${stored.token}`,
+              },
+            });
+            const meParsed = await parseJsonResponse<{
+              code?: string;
+              user?: AppUser;
+              institution?: InstitutionProfile;
+            }>(meRes);
+
+            if (meParsed.ok && meParsed.data?.user) {
+              if (meParsed.data.user.status !== 'active') {
+                clearStoredSession();
+                setSessionToken(null);
+                setAppUser(null);
+                setPendingStatusUser(meParsed.data.user);
+                return;
+              }
+              setSessionToken(stored.token);
+              setAppUser(meParsed.data.user);
+              setInstitution(meParsed.data.institution || EMPTY_INSTITUTION);
+              setIsOfflineSession(false);
+              setNeedsSetup(false);
+              saveStoredSession(stored.token, meParsed.data.user, false);
+              return;
+            }
+
+            if (meRes.status === 403) {
+              clearStoredSession();
+              setSessionToken(null);
+              setAppUser(null);
+              if (
+                meParsed.data?.code === 'ACCOUNT_PENDING' ||
+                meParsed.data?.code === 'ACCOUNT_INACTIVE'
+              ) {
+                setPendingStatusUser({
+                  ...stored.user,
+                  status: meParsed.data.code === 'ACCOUNT_PENDING' ? 'pending' : 'inactive',
+                });
+              }
+              return;
+            }
+
+            // 401 (expired token or local-only user) or transient 404/5xx/non-JSON:
+            // Preserve active login state across page refreshes in offline/cached mode.
+            const restoredUser = await resolveRestoredUser();
+            if (restoredUser) {
+              const nextToken = meRes.status === 401 ? null : stored.token;
+              setSessionToken(nextToken);
+              setAppUser(restoredUser);
+              setIsOfflineSession(true);
+              setNeedsSetup(false);
+              saveStoredSession(nextToken, restoredUser, true);
+              return;
+            }
+            clearStoredSession();
+          } catch {
+            const restoredUser = await resolveRestoredUser();
+            if (restoredUser) {
+              setSessionToken(stored.token);
+              setAppUser(restoredUser);
+              setIsOfflineSession(true);
+              setNeedsSetup(false);
+              saveStoredSession(stored.token, restoredUser, true);
+            }
+          }
+        } else {
+          const restoredUser = await resolveRestoredUser();
+          if (restoredUser) {
+            const preservedToken = stored.token || null;
+            setSessionToken(preservedToken);
+            setAppUser(restoredUser);
+            setIsOfflineSession(true);
+            setNeedsSetup(false);
+            saveStoredSession(preservedToken, restoredUser, true);
+          }
+        }
+      }
     } finally {
       await refreshQueueCount();
       setAuthLoading(false);
@@ -299,20 +589,75 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     checkBootstrapStatus();
   }, [checkBootstrapStatus]);
 
+  // Automatically restore online session state if user refreshed offline with a valid token
+  useEffect(() => {
+    if (!isOnline || !isOfflineSession || !sessionToken || !appUser) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/auth/me', {
+          cache: 'no-store',
+          headers: {
+            Accept: 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+        });
+        const parsed = await parseJsonResponse<{
+          code?: string;
+          user?: AppUser;
+          institution?: InstitutionProfile;
+        }>(res);
+        if (cancelled) return;
+        if (parsed.ok && parsed.data?.user && parsed.data.user.status === 'active') {
+          setAppUser(parsed.data.user);
+          if (parsed.data.institution) {
+            setInstitution(parsed.data.institution);
+          }
+          setIsOfflineSession(false);
+          saveStoredSession(sessionToken, parsed.data.user, false);
+        } else if (res.status === 401) {
+          saveStoredSession(null, appUser, true);
+          setSessionToken(null);
+        } else if (res.status === 403) {
+          clearStoredSession();
+          setSessionToken(null);
+          setAppUser(null);
+        }
+      } catch {
+        // Keep current cached/offline session
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [appUser, isOfflineSession, isOnline, sessionToken]);
+
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && navigator.onLine) {
+      void testConnection();
+    }
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setFirebaseUser(user);
+    });
+    return () => unsubscribe();
+  }, []);
+
   const apiRequest = useCallback(
     async <T = unknown,>(
       url: string,
       options?: {
         method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
         body?: Record<string, unknown>;
+        tokenOverride?: string;
       }
     ): Promise<T> => {
+      const effectiveToken = options?.tokenOverride ?? sessionToken;
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       };
-      if (sessionToken) {
-        headers.Authorization = `Bearer ${sessionToken}`;
+      if (effectiveToken) {
+        headers.Authorization = `Bearer ${effectiveToken}`;
       }
 
       const res = await fetch(url, {
@@ -322,7 +667,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
 
       const parsed = await parseJsonResponse<T & { error?: unknown }>(res);
-      if (!parsed.isJson || res.status === 404 || res.status >= 500) {
+      if (!parsed.isJson || res.status >= 500) {
         throw new RecoverableTransportError(
           extractErrorMessage(
             parsed.data,
@@ -330,8 +675,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           )
         );
       }
+      if (res.status === 401) {
+        throw new AuthSessionError(
+          extractErrorMessage(parsed.data, 'Sesi server kedaluwarsa. Silakan hubungkan kembali.')
+        );
+      }
       if (!parsed.ok) {
-        throw new Error(extractErrorMessage(parsed.data, 'Permintaan gagal diproses.'));
+        throw new HttpClientError(
+          extractErrorMessage(parsed.data, 'Permintaan gagal diproses.'),
+          res.status
+        );
       }
       return parsed.data as T;
     },
@@ -372,102 +725,231 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAppSettings(cachedSettings || DEFAULT_APP_SETTINGS);
   }, []);
 
-  const refreshDashboardData = useCallback(async () => {
-    setInstitutionLoading(true);
-    try {
-      if (isOnline && sessionToken) {
-        const data = await apiRequest<{
-          institution: InstitutionProfile;
-          proposals: ProposalRecord[];
-          categories: ProposalCategory[];
-          templates?: ProposalTemplate[];
-          budgets?: ProposalBudget[];
-          attachments?: ProposalAttachment[];
-          statusHistory?: ProposalStatusHistory[];
-          appSettings?: SystemAppSettings;
-        }>('/api/dashboard-data');
-
-        // Preserve any locally queued institution draft until queue flush finishes
-        const pendingQueue = await getOfflineMutationQueue();
-        const hasPendingInst = pendingQueue.some((m) => m.endpoint === '/api/institution');
-        const cachedInst = hasPendingInst
-          ? await getOfflineKV<InstitutionProfile>('institution')
-          : null;
-        const effectiveInst = cachedInst || data.institution || EMPTY_INSTITUTION;
-        const effectiveCats = data.categories || [];
-        const effectiveTpls = data.templates || [];
-        const effectiveBudgets = data.budgets || [];
-        const effectiveAtts = data.attachments || [];
-        const effectiveHist = data.statusHistory || [];
-        const effectiveSettings = data.appSettings || DEFAULT_APP_SETTINGS;
-
-        setInstitution(effectiveInst);
-        setProposals(data.proposals || []);
-        setCategories(effectiveCats);
-        setTemplates(effectiveTpls);
-        setBudgets(effectiveBudgets);
-        setAttachments(effectiveAtts);
-        setStatusHistory(effectiveHist);
-        setAppSettings(effectiveSettings);
-
-        await cacheDashboardSnapshot({
-          institution: effectiveInst,
-          proposals: data.proposals || [],
-          categories: effectiveCats,
-          templates: effectiveTpls,
-          budgets: effectiveBudgets,
-          attachments: effectiveAtts,
-          statusHistory: effectiveHist,
-          appSettings: effectiveSettings,
-        });
-      } else {
-        await loadOfflineCollections();
-      }
-    } catch {
-      await loadOfflineCollections();
-    } finally {
-      setInstitutionLoading(false);
+  const downgradeToOfflineSession = useCallback(() => {
+    const activeUser = appUser || readStoredSession()?.user || null;
+    if (activeUser && activeUser.status === 'active') {
+      saveStoredSession(null, activeUser, true);
+    } else {
+      clearStoredSession();
     }
-  }, [apiRequest, isOnline, loadOfflineCollections, sessionToken]);
+    setSessionToken(null);
+    setIsOfflineSession(true);
+  }, [appUser]);
+
+  const refreshDashboardData = useCallback(
+    async (tokenOverride?: string) => {
+      const activeToken = tokenOverride ?? sessionToken;
+      setInstitutionLoading(true);
+      try {
+        if (navigator.onLine && activeToken) {
+          const data = await apiRequest<{
+            institution: InstitutionProfile;
+            proposals: ProposalRecord[];
+            categories: ProposalCategory[];
+            templates?: ProposalTemplate[];
+            budgets?: ProposalBudget[];
+            attachments?: ProposalAttachment[];
+            statusHistory?: ProposalStatusHistory[];
+            appSettings?: SystemAppSettings;
+          }>('/api/dashboard-data', { tokenOverride: activeToken });
+
+          // Preserve any locally queued institution draft until queue flush finishes
+          const pendingQueue = await getOfflineMutationQueue();
+          const hasPendingInst = pendingQueue.some((m) => m.endpoint === '/api/institution');
+          const cachedInst = hasPendingInst
+            ? await getOfflineKV<InstitutionProfile>('institution')
+            : null;
+          const effectiveInst = cachedInst || data.institution || EMPTY_INSTITUTION;
+          const effectiveCats = data.categories || [];
+          const effectiveTpls = data.templates || [];
+          const effectiveBudgets = data.budgets || [];
+          const effectiveAtts = data.attachments || [];
+          const effectiveHist = data.statusHistory || [];
+          const effectiveSettings = data.appSettings || DEFAULT_APP_SETTINGS;
+
+          setInstitution(effectiveInst);
+          setProposals(data.proposals || []);
+          setCategories(effectiveCats);
+          setTemplates(effectiveTpls);
+          setBudgets(effectiveBudgets);
+          setAttachments(effectiveAtts);
+          setStatusHistory(effectiveHist);
+          setAppSettings(effectiveSettings);
+
+          await cacheDashboardSnapshot({
+            institution: effectiveInst,
+            proposals: data.proposals || [],
+            categories: effectiveCats,
+            templates: effectiveTpls,
+            budgets: effectiveBudgets,
+            attachments: effectiveAtts,
+            statusHistory: effectiveHist,
+            appSettings: effectiveSettings,
+          });
+        } else {
+          await loadOfflineCollections();
+        }
+      } catch {
+        await loadOfflineCollections();
+      } finally {
+        setInstitutionLoading(false);
+      }
+    },
+    [apiRequest, loadOfflineCollections, sessionToken]
+  );
+
+  const flushQueueWithToken = useCallback(
+    async (
+      tokenToUse: string
+    ): Promise<{ syncedCount: number; failedCount: number; lastError: string | null }> => {
+      if (syncInFlightRef.current) {
+        return { syncedCount: 0, failedCount: 0, lastError: null };
+      }
+      const rawQueue = await getOfflineMutationQueue();
+      if (rawQueue.length === 0) {
+        setLastSyncError(null);
+        return { syncedCount: 0, failedCount: 0, lastError: null };
+      }
+
+      syncInFlightRef.current = true;
+      setSyncing(true);
+      setLastSyncError(null);
+
+      const queue = [...rawQueue].sort((a, b) =>
+        (a.createdAt || '').localeCompare(b.createdAt || '')
+      );
+      let syncedCount = 0;
+      let failedCount = 0;
+      let lastError: string | null = null;
+
+      try {
+        for (const item of queue) {
+          try {
+            await apiRequest(item.endpoint, {
+              method: item.method,
+              body: item.body,
+              tokenOverride: tokenToUse,
+            });
+            await removeOfflineMutation(item.id);
+            syncedCount += 1;
+          } catch (err) {
+            if (err instanceof AuthSessionError) {
+              downgradeToOfflineSession();
+              lastError = 'Sesi server kedaluwarsa. Masukkan kata sandi untuk menyambung kembali.';
+              setLastSyncError(lastError);
+              break;
+            }
+            if (err instanceof TypeError || err instanceof RecoverableTransportError) {
+              lastError = 'Server belum merespons saat menyinkronkan.';
+              setLastSyncError(lastError);
+              break;
+            }
+            if (err instanceof HttpClientError && err.status === 404 && item.method === 'DELETE') {
+              // Target already absent on server; safe to clear from queue
+              await removeOfflineMutation(item.id);
+              syncedCount += 1;
+              continue;
+            }
+            failedCount += 1;
+            lastError =
+              err instanceof Error ? err.message : 'Sebagian perubahan gagal disinkronkan.';
+            setLastSyncError(lastError);
+          }
+        }
+      } finally {
+        await refreshQueueCount();
+        setSyncing(false);
+        syncInFlightRef.current = false;
+      }
+
+      if (syncedCount > 0) {
+        await refreshDashboardData(tokenToUse);
+      }
+
+      return { syncedCount, failedCount, lastError };
+    },
+    [apiRequest, downgradeToOfflineSession, refreshDashboardData, refreshQueueCount]
+  );
+
+  const flushFirestoreNow = useCallback(async (): Promise<{
+    syncedCount: number;
+    failedCount: number;
+    lastError: string | null;
+  }> => {
+    setFirestoreSyncing(true);
+    try {
+      const res = await processFirestoreSyncQueue({
+        institutionFallback: institution,
+        onQueueChange: setFirestoreQueue,
+      });
+      setLastFirestoreSyncError(res.lastError);
+      return res;
+    } finally {
+      setFirestoreQueue(await getFirestoreSyncQueue());
+      setFirestoreSyncing(false);
+    }
+  }, [institution]);
 
   // Flush queued offline mutations automatically when internet & session token are available
   useEffect(() => {
     if (!isOnline || !sessionToken || !appUser) return;
+    flushQueueWithToken(sessionToken);
+  }, [isOnline, sessionToken, appUser, flushQueueWithToken]);
 
-    let cancelled = false;
-    const flushQueue = async () => {
-      const queue = await getOfflineMutationQueue();
-      if (queue.length === 0) return;
+  // Flush queued Firestore changes automatically whenever online & Firebase Auth is active
+  useEffect(() => {
+    if (!isOnline || !firestoreConnected || !appUser) return;
+    void flushFirestoreNow();
+  }, [isOnline, firestoreConnected, appUser, flushFirestoreNow]);
 
-      let syncedAny = false;
-      for (const item of queue) {
-        if (cancelled) break;
-        try {
-          await apiRequest(item.endpoint, {
-            method: item.method,
-            body: item.body,
-          });
-          await removeOfflineMutation(item.id);
-          syncedAny = true;
-        } catch (err) {
-          // Stop on transport outage; drop permanent 4xx rejection only if auth not broken
-          if (err instanceof TypeError || err instanceof RecoverableTransportError) {
-            break;
-          }
-          break;
+  // Listen to Service Worker background sync triggers & tab visibility/online transitions
+  useEffect(() => {
+    const handleSwMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'BACKGROUND_SYNC_TRIGGER') {
+        void refreshQueueCount();
+        if (navigator.onLine && sessionToken) {
+          void flushQueueWithToken(sessionToken);
+        }
+        if (navigator.onLine && firestoreConnected) {
+          void flushFirestoreNow();
+        }
+        if (appUser && sessionToken && navigator.onLine) {
+          void refreshDashboardData(sessionToken);
         }
       }
-      await refreshQueueCount();
-      if (syncedAny && !cancelled) {
-        await refreshDashboardData();
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && navigator.onLine && appUser) {
+        if (sessionToken) {
+          void flushQueueWithToken(sessionToken);
+        }
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
       }
     };
 
-    flushQueue();
+    if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('message', handleSwMessage);
+    }
+    document.addEventListener('visibilitychange', handleVisibility);
+
     return () => {
-      cancelled = true;
+      if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+        navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+      }
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [isOnline, sessionToken, appUser, apiRequest, refreshQueueCount, refreshDashboardData]);
+  }, [
+    appUser,
+    firestoreConnected,
+    flushFirestoreNow,
+    flushQueueWithToken,
+    refreshDashboardData,
+    refreshQueueCount,
+    sessionToken,
+  ]);
 
   const applyAuthenticatedSession = async (
     username: string,
@@ -484,12 +966,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       : null;
     const effectiveInst = cachedInst || inst || EMPTY_INSTITUTION;
 
+    saveStoredSession(token, user, false);
     setSessionToken(token);
     setAppUser(user);
     setInstitution(effectiveInst);
     setPendingStatusUser(null);
     setIsOfflineSession(false);
     setNeedsSetup(false);
+    setLastSyncError(null);
 
     await cacheOfflineAuthCredential(username, password, user, recoveryCode);
     await setOfflineKV('institution', effectiveInst);
@@ -497,6 +981,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const applyLocalOfflineSession = async (user: AppUser) => {
+    saveStoredSession(null, user, true);
     setSessionToken(null);
     setAppUser(user);
     setIsOfflineSession(true);
@@ -1108,6 +1593,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     setInstitution(optimisticInst);
     await setOfflineKV('institution', optimisticInst);
+    await enqueueEntityToFirestore(
+      'institutions',
+      INSTITUTION_DOC_ID,
+      'upsert',
+      buildInstitutionFirestorePayload(optimisticInst),
+      `Profil Lembaga (${optimisticInst.name || 'Ar-Raudhah'})`
+    );
 
     if (navigator.onLine && sessionToken) {
       try {
@@ -1124,9 +1616,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         };
         setInstitution(mergedInst);
         await setOfflineKV('institution', mergedInst);
+        await enqueueEntityToFirestore(
+          'institutions',
+          INSTITUTION_DOC_ID,
+          'upsert',
+          buildInstitutionFirestorePayload(mergedInst),
+          `Profil Lembaga (${mergedInst.name || 'Ar-Raudhah'})`
+        );
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { url: res.url, queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1146,6 +1651,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   ): Promise<{ queuedOffline: boolean }> => {
     setInstitution(payload);
     await setOfflineKV('institution', payload);
+    await enqueueEntityToFirestore(
+      'institutions',
+      INSTITUTION_DOC_ID,
+      'upsert',
+      buildInstitutionFirestorePayload(payload),
+      `Profil Lembaga (${payload.name || 'Ar-Raudhah'})`
+    );
 
     if (navigator.onLine && sessionToken) {
       try {
@@ -1155,9 +1667,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         });
         setInstitution(res.institution);
         await setOfflineKV('institution', res.institution);
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1188,6 +1706,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         body: payload as unknown as Record<string, unknown>,
       });
       setAppUser(res.user);
+      saveStoredSession(sessionToken, res.user, false);
       await updateOfflineAuthUserMetadata(
         res.user.uid,
         res.user,
@@ -1229,6 +1748,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       cleanRecovery
     );
     setAppUser(updatedLocal);
+    saveStoredSession(sessionToken, updatedLocal, isOfflineSession);
     await enqueueOfflineMutation({
       endpoint: '/api/auth/me',
       method: 'PATCH',
@@ -1242,18 +1762,302 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return { queuedOffline: true };
   };
 
+  const openReconnectModal = useCallback(() => {
+    setReconnectModalOpen(true);
+  }, []);
+
+  const closeReconnectModal = useCallback(() => {
+    setReconnectModalOpen(false);
+  }, []);
+
+  const openCloudSyncModal = useCallback(() => {
+    setCloudSyncModalOpen(true);
+  }, []);
+
+  const closeCloudSyncModal = useCallback(() => {
+    setCloudSyncModalOpen(false);
+  }, []);
+
+  const clearPendingQueue = useCallback(async () => {
+    await clearOfflineMutationQueue();
+    await refreshQueueCount();
+    setLastSyncError(null);
+  }, [refreshQueueCount]);
+
+  const clearFirestoreQueue = useCallback(async () => {
+    await clearFirestoreSyncQueue();
+    await refreshQueueCount();
+    setLastFirestoreSyncError(null);
+  }, [refreshQueueCount]);
+
+  const syncFirestoreNow = useCallback(async () => {
+    await resetFailedFirestoreItems();
+    return flushFirestoreNow();
+  }, [flushFirestoreNow]);
+
+  const retryFailedFirestoreSync = useCallback(async () => {
+    await resetFailedFirestoreItems();
+    return flushFirestoreNow();
+  }, [flushFirestoreNow]);
+
+  const pushAllLocalToFirestore = useCallback(async () => {
+    const enqueuedCount = await enqueueFullSnapshotToFirestore({
+      institution,
+      categories,
+      templates,
+      proposals,
+      budgets,
+      attachments,
+      statusHistory,
+    });
+    await refreshQueueCount();
+    const res = await flushFirestoreNow();
+    return {
+      enqueuedCount,
+      ...res,
+    };
+  }, [
+    attachments,
+    budgets,
+    categories,
+    flushFirestoreNow,
+    institution,
+    proposals,
+    refreshQueueCount,
+    statusHistory,
+    templates,
+  ]);
+
+  const connectFirestoreCloud = useCallback(async () => {
+    if (!navigator.onLine) {
+      throw new Error('Koneksi internet diperlukan untuk menghubungkan akun Google Firestore.');
+    }
+    const user = await signInFirebaseWithGoogle();
+    setFirebaseUser(user);
+
+    const existingQueue = await getFirestoreSyncQueue();
+    if (existingQueue.length === 0) {
+      await enqueueFullSnapshotToFirestore({
+        institution,
+        categories,
+        templates,
+        proposals,
+        budgets,
+        attachments,
+        statusHistory,
+      });
+      await refreshQueueCount();
+    }
+
+    setFirestoreSyncing(true);
+    try {
+      const res = await processFirestoreSyncQueue({
+        institutionFallback: institution,
+        onQueueChange: setFirestoreQueue,
+      });
+      setLastFirestoreSyncError(res.lastError);
+      return res;
+    } finally {
+      setFirestoreQueue(await getFirestoreSyncQueue());
+      setFirestoreSyncing(false);
+    }
+  }, [
+    attachments,
+    budgets,
+    categories,
+    institution,
+    proposals,
+    refreshQueueCount,
+    statusHistory,
+    templates,
+  ]);
+
+  const disconnectFirestoreCloud = useCallback(async () => {
+    await signOutFirebase();
+    setFirebaseUser(null);
+    setLastFirestoreSyncError(null);
+  }, []);
+
+  const syncNow = useCallback(async (): Promise<{
+    syncedCount: number;
+    failedCount: number;
+    lastError: string | null;
+  }> => {
+    if (!navigator.onLine) {
+      return {
+        syncedCount: 0,
+        failedCount: 0,
+        lastError: 'Perangkat masih offline. Hubungkan ke internet terlebih dahulu.',
+      };
+    }
+    if (!sessionToken) {
+      setReconnectModalOpen(true);
+      return {
+        syncedCount: 0,
+        failedCount: 0,
+        lastError: 'Sesi server belum aktif. Masukkan kata sandi untuk menyambung dan menyinkronkan.',
+      };
+    }
+    const serverRes = await flushQueueWithToken(sessionToken);
+    if (firestoreConnected) {
+      await flushFirestoreNow();
+    }
+    return serverRes;
+  }, [firestoreConnected, flushFirestoreNow, flushQueueWithToken, sessionToken]);
+
+  const reconnectServerSession = useCallback(
+    async (
+      password: string
+    ): Promise<{ syncedCount: number; failedCount: number; lastError: string | null }> => {
+      if (!appUser) {
+        throw new Error('Tidak ada akun aktif yang dapat dihubungkan.');
+      }
+      if (!navigator.onLine) {
+        throw new Error('Perangkat masih offline. Hubungkan ke internet terlebih dahulu.');
+      }
+
+      const username = (appUser.username || appUser.displayName || '').trim();
+      if (!username) {
+        throw new Error('Nama pengguna tidak ditemukan pada sesi lokal.');
+      }
+
+      const loginRes = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ username, password }),
+      });
+
+      const loginParsed = await parseJsonResponse<{
+        token?: string;
+        user?: AppUser;
+        institution?: InstitutionProfile;
+        error?: unknown;
+      }>(loginRes);
+
+      if (!loginParsed.isJson || loginRes.status >= 500) {
+        throw new Error('Server belum merespons. Periksa koneksi internet dan coba lagi.');
+      }
+
+      let activeToken = loginParsed.data?.token;
+      let activeUser = loginParsed.data?.user;
+      let activeInst = loginParsed.data?.institution;
+
+      // If this account was created locally offline and doesn't exist on server yet
+      if ((!loginParsed.ok || !activeToken || !activeUser) && appUser.uid.startsWith('local_')) {
+        const bootRes = await fetch('/api/auth/bootstrap-status', {
+          headers: { Accept: 'application/json' },
+        });
+        const bootParsed = await parseJsonResponse<{ needsSetup?: boolean }>(bootRes);
+
+        if (bootParsed.ok && bootParsed.data?.needsSetup && appUser.role === 'Administrator') {
+          const setupRes = await fetch('/api/auth/setup', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify({
+              username,
+              displayName: appUser.displayName || username,
+              password,
+            }),
+          });
+          const setupParsed = await parseJsonResponse<{
+            token?: string;
+            user?: AppUser;
+            institution?: InstitutionProfile;
+            error?: unknown;
+          }>(setupRes);
+          if (setupParsed.ok && setupParsed.data?.token && setupParsed.data?.user) {
+            activeToken = setupParsed.data.token;
+            activeUser = setupParsed.data.user;
+            activeInst = setupParsed.data.institution;
+          }
+        } else if (loginRes.status === 401 || loginRes.status === 404) {
+          const regRes = await fetch('/api/auth/register', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify({
+              username,
+              displayName: appUser.displayName || username,
+              password,
+              role: appUser.role,
+            }),
+          });
+          const regParsed = await parseJsonResponse<{
+            token?: string;
+            user?: AppUser;
+            institution?: InstitutionProfile;
+            pending?: boolean;
+            error?: unknown;
+          }>(regRes);
+          if (regParsed.ok && regParsed.data?.token && regParsed.data?.user) {
+            activeToken = regParsed.data.token;
+            activeUser = regParsed.data.user;
+            activeInst = regParsed.data.institution;
+          } else if (regParsed.data?.pending) {
+            throw new Error(
+              'Akun lokal telah dikirim ke server dan menunggu aktivasi oleh Administrator.'
+            );
+          }
+        }
+      }
+
+      if (!activeToken || !activeUser) {
+        throw new Error(
+          extractErrorMessage(
+            loginParsed.data,
+            'Kata sandi tidak sesuai atau akun belum terdaftar di server.'
+          )
+        );
+      }
+
+      await applyAuthenticatedSession(
+        username,
+        password,
+        activeToken,
+        activeUser,
+        activeInst || EMPTY_INSTITUTION
+      );
+
+      return flushQueueWithToken(activeToken);
+    },
+    [appUser, flushQueueWithToken]
+  );
+
   const generateAiNarrative = async (
     payload: AiNarrativeRequest
   ): Promise<AiNarrativeResponse> => {
-    if (!navigator.onLine || !sessionToken) {
+    if (!navigator.onLine) {
+      throw new Error('Pembuatan narasi menggunakan AI memerlukan koneksi internet yang aktif.');
+    }
+    if (!sessionToken) {
+      setReconnectModalOpen(true);
       throw new Error(
-        'Pembuatan narasi menggunakan AI memerlukan koneksi internet dan sesi server yang aktif.'
+        'Sesi server belum aktif. Silakan masukkan kata sandi pada jendela penghubungan untuk mengaktifkan AI.'
       );
     }
-    return apiRequest<AiNarrativeResponse>('/api/ai/generate-narrative', {
-      method: 'POST',
-      body: payload as unknown as Record<string, unknown>,
-    });
+    try {
+      return await apiRequest<AiNarrativeResponse>('/api/ai/generate-narrative', {
+        method: 'POST',
+        body: payload as unknown as Record<string, unknown>,
+      });
+    } catch (err) {
+      if (err instanceof AuthSessionError) {
+        downgradeToOfflineSession();
+        setReconnectModalOpen(true);
+        throw new Error(
+          'Sesi server kedaluwarsa. Masukkan kata sandi pada jendela penghubungan untuk melanjutkan pembuatan narasi AI.'
+        );
+      }
+      throw err;
+    }
   };
 
   const saveCategory = async (
@@ -1277,6 +2081,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       : [...categories, localCat];
     setCategories(nextCats);
     await setOfflineKV('categories', nextCats);
+    await enqueueEntityToFirestore(
+      'proposalCategories',
+      localCat.id,
+      'upsert',
+      buildCategoryFirestorePayload(localCat),
+      `Kategori: ${localCat.name}`
+    );
 
     if (navigator.onLine && sessionToken) {
       try {
@@ -1292,9 +2103,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           : [...categories, res.category];
         setCategories(synced);
         await setOfflineKV('categories', synced);
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { category: res.category, queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1313,13 +2130,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const nextCats = categories.filter((c) => c.id !== id);
     setCategories(nextCats);
     await setOfflineKV('categories', nextCats);
+    await enqueueEntityToFirestore(
+      'proposalCategories',
+      id,
+      'delete',
+      {},
+      `Hapus Kategori (${id})`
+    );
 
     if (navigator.onLine && sessionToken) {
       try {
         await apiRequest(`/api/categories/${id}`, { method: 'DELETE' });
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1355,6 +2185,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       : [...templates, localTpl];
     setTemplates(nextTpls);
     await setOfflineKV('templates', nextTpls);
+    await enqueueEntityToFirestore(
+      'proposalTemplates',
+      localTpl.id,
+      'upsert',
+      buildTemplateFirestorePayload(localTpl),
+      `Template: ${localTpl.name}`
+    );
 
     if (navigator.onLine && sessionToken) {
       try {
@@ -1370,9 +2207,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           : [...templates, res.template];
         setTemplates(synced);
         await setOfflineKV('templates', synced);
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { template: res.template, queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1402,9 +2245,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const nextTpls = [...templates, res.template];
         setTemplates(nextTpls);
         await setOfflineKV('templates', nextTpls);
+        await enqueueEntityToFirestore(
+          'proposalTemplates',
+          res.template.id,
+          'upsert',
+          buildTemplateFirestorePayload(res.template),
+          `Template: ${res.template.name}`
+        );
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { template: res.template, queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1428,13 +2284,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const nextTpls = templates.filter((t) => t.id !== id);
     setTemplates(nextTpls);
     await setOfflineKV('templates', nextTpls);
+    await enqueueEntityToFirestore(
+      'proposalTemplates',
+      id,
+      'delete',
+      {},
+      `Hapus Template (${id})`
+    );
 
     if (navigator.onLine && sessionToken) {
       try {
         await apiRequest(`/api/templates/${id}`, { method: 'DELETE' });
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1494,6 +2363,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       : [localProposal, ...proposals];
     setProposals(nextProps);
     await setOfflineKV('proposals', nextProps);
+    await enqueueEntityToFirestore(
+      'proposals',
+      localProposal.id,
+      'upsert',
+      buildProposalFirestorePayload(localProposal),
+      `Proposal: ${localProposal.title}`
+    );
+    if (localProposal.isArchived) {
+      await enqueueEntityToFirestore(
+        'proposalArchives',
+        localProposal.id,
+        'upsert',
+        buildArchiveFirestorePayload(localProposal),
+        `Arsip: ${localProposal.title}`
+      );
+    }
 
     if (navigator.onLine && sessionToken) {
       try {
@@ -1509,9 +2394,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           : [res.proposal, ...proposals];
         setProposals(synced);
         await setOfflineKV('proposals', synced);
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { proposal: res.proposal, queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1538,10 +2429,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           `/api/proposals/${id}/duplicate`,
           { method: 'POST', body: {} }
         );
+        await enqueueEntityToFirestore(
+          'proposals',
+          res.proposal.id,
+          'upsert',
+          buildProposalFirestorePayload(res.proposal),
+          `Proposal: ${res.proposal.title}`
+        );
         await refreshDashboardData();
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { proposal: res.proposal, queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1618,6 +2522,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setStatusHistory(nextHist);
     await setOfflineKV('statusHistory', nextHist);
 
+    await enqueueEntityToFirestore(
+      'proposals',
+      id,
+      'upsert',
+      buildProposalFirestorePayload(updatedLocal),
+      `Update Status Proposal: ${updatedLocal.title} (${payload.status})`
+    );
+    await enqueueEntityToFirestore(
+      'proposalStatusHistory',
+      localHist.id,
+      'upsert',
+      buildStatusHistoryFirestorePayload(localHist),
+      `Riwayat Status: ${updatedLocal.title} -> ${payload.status}`
+    );
+
     if (navigator.onLine && sessionToken) {
       try {
         const res = await apiRequest<{
@@ -1633,9 +2552,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const syncedHist = [res.historyEntry, ...statusHistory];
         setStatusHistory(syncedHist);
         await setOfflineKV('statusHistory', syncedHist);
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { proposal: res.proposal, queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1657,13 +2582,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setBudgets(nextBudgets);
     await setOfflineKV('proposals', nextProps);
     await setOfflineKV('budgets', nextBudgets);
+    await enqueueEntityToFirestore('proposals', id, 'delete', {}, `Hapus Proposal (${id})`);
 
     if (navigator.onLine && sessionToken) {
       try {
         await apiRequest(`/api/proposals/${id}`, { method: 'DELETE' });
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1720,6 +2652,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setProposals(nextProps);
     await setOfflineKV('proposals', nextProps);
 
+    if (linkedProp) {
+      await enqueueEntityToFirestore(
+        'proposals',
+        linkedProp.id,
+        'upsert',
+        buildProposalFirestorePayload({ ...linkedProp, totalBudget: totalAmount, updatedAt: now }),
+        `Proposal: ${linkedProp.title}`
+      );
+    }
+    await enqueueEntityToFirestore(
+      'proposalBudgets',
+      localBudget.id,
+      'upsert',
+      buildBudgetFirestorePayload(localBudget),
+      `RAB: ${localBudget.title}`
+    );
+
     if (navigator.onLine && sessionToken) {
       try {
         const res = await apiRequest<{ budget: ProposalBudget }>('/api/budgets', {
@@ -1736,9 +2685,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         );
         setProposals(syncedProps);
         await setOfflineKV('proposals', syncedProps);
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { budget: res.budget, queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1765,13 +2720,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setProposals(nextProps);
       await setOfflineKV('proposals', nextProps);
     }
+    await enqueueEntityToFirestore('proposalBudgets', id, 'delete', {}, `Hapus RAB (${id})`);
 
     if (navigator.onLine && sessionToken) {
       try {
         await apiRequest(`/api/budgets/${id}`, { method: 'DELETE' });
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1818,6 +2780,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAttachments(nextAtts);
     await setOfflineKV('attachments', nextAtts);
 
+    const attFsPayload = buildAttachmentFirestorePayload(localAtt);
+    if (attFsPayload) {
+      await enqueueEntityToFirestore(
+        'proposalAttachments',
+        attId,
+        'upsert',
+        attFsPayload,
+        `Lampiran: ${localAtt.title}`
+      );
+    }
+
     if (navigator.onLine && sessionToken) {
       try {
         const res = await apiRequest<{ attachment: ProposalAttachment }>('/api/attachments', {
@@ -1839,9 +2812,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const synced = [res.attachment, ...attachments];
         setAttachments(synced);
         await setOfflineKV('attachments', synced);
+        const syncedFsPayload = buildAttachmentFirestorePayload(res.attachment);
+        if (syncedFsPayload) {
+          await enqueueEntityToFirestore(
+            'proposalAttachments',
+            res.attachment.id,
+            'upsert',
+            syncedFsPayload,
+            `Lampiran: ${res.attachment.title}`
+          );
+        }
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { attachment: res.attachment, queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1872,13 +2861,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const nextAtts = attachments.filter((a) => a.id !== id);
     setAttachments(nextAtts);
     await setOfflineKV('attachments', nextAtts);
+    await enqueueEntityToFirestore(
+      'proposalAttachments',
+      id,
+      'delete',
+      {},
+      `Hapus Lampiran (${id})`
+    );
 
     if (navigator.onLine && sessionToken) {
       try {
         await apiRequest(`/api/attachments/${id}`, { method: 'DELETE' });
+        await refreshQueueCount();
+        if (firestoreConnected) {
+          void flushFirestoreNow();
+        }
         return { queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1905,7 +2907,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         await setOfflineKV('appSettings', res.appSettings);
         return { queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+        if (err instanceof AuthSessionError) {
+          downgradeToOfflineSession();
+        } else if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -1946,6 +2950,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const signOutUser = () => {
+    clearStoredSession();
+    void setOfflineKV('swSyncToken', null);
     setSessionToken(null);
     setAppUser(null);
     setInstitution(null);
@@ -1957,6 +2963,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setStatusHistory([]);
     setPendingStatusUser(null);
     setIsOfflineSession(false);
+    setReconnectModalOpen(false);
+    setCloudSyncModalOpen(false);
+    setLastSyncError(null);
     setAuthError(null);
     setAuthNotice(null);
   };
@@ -1986,6 +2995,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         hasEnvAdminPasscode,
         isOfflineSession,
         pendingSyncCount,
+        syncing,
+        lastSyncError,
+        reconnectModalOpen,
+        openReconnectModal,
+        closeReconnectModal,
+        syncNow,
+        clearPendingQueue,
+        reconnectServerSession,
+        firebaseUser,
+        firestoreConnected,
+        firestoreQueue,
+        pendingFirestoreCount,
+        firestoreSyncing,
+        lastFirestoreSyncError,
+        cloudSyncModalOpen,
+        openCloudSyncModal,
+        closeCloudSyncModal,
+        connectFirestoreCloud,
+        disconnectFirestoreCloud,
+        syncFirestoreNow,
+        pushAllLocalToFirestore,
+        clearFirestoreQueue,
+        retryFailedFirestoreSync,
         pendingStatusUser,
         authError,
         authNotice,

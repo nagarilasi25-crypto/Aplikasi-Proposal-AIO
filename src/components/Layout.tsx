@@ -18,10 +18,17 @@ import {
   Menu,
   X,
   ChevronRight,
+  Cloud,
+  RefreshCw,
+  Wifi,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import { useOnlineStatus } from '../hooks/useOnlineStatus';
+import { useToast } from './Toast';
 import { PWAInstallButton } from './PWAInstallButton';
 import { OfflineIndicator } from './OfflineIndicator';
+import { ReconnectModal } from './ReconnectModal';
+import { CloudSyncModal } from './CloudSyncModal';
 import { isSafeImageUrl } from '../lib/imageUtils';
 
 interface NavItem {
@@ -95,10 +102,39 @@ const ROUTE_TITLES: Record<string, string> = {
 };
 
 export function Layout({ children }: { children: React.ReactNode }) {
-  const { appUser, institution, pendingSyncCount, signOutUser } = useAuth();
+  const {
+    appUser,
+    institution,
+    isOfflineSession,
+    pendingSyncCount,
+    syncing,
+    syncNow,
+    openReconnectModal,
+    firestoreConnected,
+    pendingFirestoreCount,
+    firestoreSyncing,
+    openCloudSyncModal,
+    signOutUser,
+  } = useAuth();
+  const isOnline = useOnlineStatus();
+  const { showToast } = useToast();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [logoFailed, setLogoFailed] = useState(false);
   const location = useLocation();
+
+  const handleManualSync = async () => {
+    const res = await syncNow();
+    if (res.lastError) {
+      if (isOnline && isOfflineSession) {
+        return;
+      }
+      showToast(res.lastError, 'error');
+    } else if (res.syncedCount > 0) {
+      showToast(`${res.syncedCount} perubahan berhasil disinkronkan ke server.`, 'success');
+    } else if (isOnline && !isOfflineSession) {
+      showToast('Semua data sudah tersinkronisasi dengan server.', 'success');
+    }
+  };
 
   useEffect(() => {
     setLogoFailed(false);
@@ -262,12 +298,67 @@ export function Layout({ children }: { children: React.ReactNode }) {
             </div>
           </div>
 
-          <div className="flex shrink-0 items-center gap-3">
+          <div className="flex shrink-0 items-center gap-2.5 sm:gap-3">
             {pendingSyncCount > 0 && (
-              <span className="hidden text-xs font-medium text-[#D97706] sm:inline whitespace-nowrap">
-                {pendingSyncCount} perubahan menunggu sinkronisasi
-              </span>
+              <button
+                type="button"
+                onClick={handleManualSync}
+                disabled={syncing}
+                title="Klik untuk menyinkronkan perubahan ke server"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-xs font-semibold text-amber-800 transition-colors hover:bg-amber-100 disabled:opacity-60 whitespace-nowrap shrink-0"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 shrink-0 ${syncing ? 'animate-spin' : ''}`} />
+                <span className="hidden sm:inline">
+                  {syncing
+                    ? 'Menyinkronkan...'
+                    : isOfflineSession
+                    ? `${pendingSyncCount} menunggu · Sinkronkan`
+                    : `${pendingSyncCount} menunggu sinkronisasi`}
+                </span>
+                <span className="sm:hidden">{pendingSyncCount}</span>
+              </button>
             )}
+            {isOnline && isOfflineSession && pendingSyncCount === 0 && (
+              <button
+                type="button"
+                onClick={openReconnectModal}
+                title="Hubungkan sesi server untuk sinkronisasi otomatis dan fitur AI"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-[#0F3D2E] transition-colors hover:bg-emerald-100 whitespace-nowrap shrink-0"
+              >
+                <Wifi className="h-3.5 w-3.5 shrink-0" />
+                <span className="hidden sm:inline">Mode Lokal · Hubungkan</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={openCloudSyncModal}
+              title="Kelola antrean sinkronisasi latar belakang & Firestore"
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                firestoreConnected
+                  ? 'border-emerald-200 bg-emerald-50/70 text-[#0F3D2E] hover:bg-emerald-100'
+                  : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              {firestoreSyncing ? (
+                <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin text-[#0F3D2E]" />
+              ) : (
+                <Cloud className="h-3.5 w-3.5 shrink-0" />
+              )}
+              <span className="hidden md:inline">
+                {firestoreSyncing
+                  ? 'Sync Cloud...'
+                  : firestoreConnected
+                  ? pendingFirestoreCount > 0
+                    ? `Firestore (${pendingFirestoreCount})`
+                    : 'Firestore Aktif'
+                  : pendingFirestoreCount > 0
+                  ? `Antrean Cloud (${pendingFirestoreCount})`
+                  : 'Cloud Sync'}
+              </span>
+              {pendingFirestoreCount > 0 && (
+                <span className="md:hidden">{pendingFirestoreCount}</span>
+              )}
+            </button>
             <PWAInstallButton compact />
             <div className="hidden items-center gap-2 text-xs text-slate-500 md:flex">
               <span className="font-medium text-slate-700">{appUser?.displayName}</span>
@@ -290,6 +381,8 @@ export function Layout({ children }: { children: React.ReactNode }) {
       </div>
 
       <OfflineIndicator />
+      <ReconnectModal />
+      <CloudSyncModal />
     </div>
   );
 }

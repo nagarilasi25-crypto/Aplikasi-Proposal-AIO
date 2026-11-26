@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { FileCheck2, Save } from 'lucide-react';
+import { Cloud, FileCheck2, RefreshCw, Save } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../components/Toast';
 import { BLUEPRINT_LIMITS, SystemAppSettings } from '../types/models';
@@ -35,7 +35,16 @@ const STAGES = [
 ];
 
 export function SettingsPage() {
-  const { appUser, appSettings, updateOwnProfile, saveAppSettings } = useAuth();
+  const {
+    appUser,
+    appSettings,
+    firebaseUser,
+    firestoreConnected,
+    pendingFirestoreCount,
+    openCloudSyncModal,
+    updateOwnProfile,
+    saveAppSettings,
+  } = useAuth();
   const { showToast } = useToast();
 
   const canManageDocSettings =
@@ -376,6 +385,38 @@ export function SettingsPage() {
             </div>
           )}
         </form>
+      </section>
+
+      <section className="rounded-xl border border-slate-200 bg-white p-6">
+        <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+          <div className="flex items-start gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#0F3D2E]/10 text-[#0F3D2E]">
+              <Cloud className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="font-display text-base font-semibold text-[#111C18]">
+                Sinkronisasi Latar Belakang & Cloud Firestore
+              </h3>
+              <p className="mt-1 text-xs text-slate-600">
+                {firestoreConnected
+                  ? `Terhubung ke Firestore (${firebaseUser?.email}). Perubahan lokal saat offline otomatis disinkronkan ketika internet kembali.`
+                  : 'Hubungkan akun Google Anda untuk mengaktifkan cadangan dan sinkronisasi otomatis proposal ke Cloud Firestore.'}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={openCloudSyncModal}
+            className="inline-flex shrink-0 items-center gap-2 rounded-lg bg-[#0F3D2E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#144D3A]"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            {pendingFirestoreCount > 0
+              ? `Kelola Antrean (${pendingFirestoreCount})`
+              : firestoreConnected
+              ? 'Kelola Sinkronisasi Cloud'
+              : 'Hubungkan & Sinkronkan'}
+          </button>
+        </div>
       </section>
 
       <section className="rounded-xl border border-slate-200 bg-white p-6">

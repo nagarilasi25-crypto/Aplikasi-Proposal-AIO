@@ -11,7 +11,7 @@ import {
 } from '../types/models';
 
 const DB_NAME = 'arraudhah_offline_db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 interface OfflineAuthRecord {
   usernameKey: string;
@@ -31,6 +31,43 @@ export interface OfflineSyncMutation {
   createdAt: string;
 }
 
+export type FirestoreSyncCollection =
+  | 'institutions'
+  | 'proposalCategories'
+  | 'proposalTemplates'
+  | 'proposals'
+  | 'proposalBudgets'
+  | 'proposalAttachments'
+  | 'proposalArchives'
+  | 'proposalStatusHistory';
+
+export type FirestoreQueueStatus = 'pending' | 'syncing' | 'failed';
+
+export interface FirestoreSyncItem {
+  id: string;
+  collection: FirestoreSyncCollection;
+  docId: string;
+  operation: 'upsert' | 'delete';
+  payload: Record<string, unknown>;
+  label: string;
+  status: FirestoreQueueStatus;
+  retryCount: number;
+  lastError?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+const COLLECTION_PRIORITY: Record<FirestoreSyncCollection, number> = {
+  institutions: 1,
+  proposalCategories: 2,
+  proposalTemplates: 3,
+  proposals: 4,
+  proposalBudgets: 5,
+  proposalAttachments: 6,
+  proposalArchives: 7,
+  proposalStatusHistory: 8,
+};
+
 function openOfflineDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -44,6 +81,9 @@ function openOfflineDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains('syncQueue')) {
         db.createObjectStore('syncQueue', { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains('firestoreQueue')) {
+        db.createObjectStore('firestoreQueue', { keyPath: 'id' });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -527,6 +567,7 @@ export async function enqueueOfflineMutation(
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+  void registerBackgroundSync('arraudhah-sync-queue');
 }
 
 export async function getOfflineMutationQueue(): Promise<OfflineSyncMutation[]> {
@@ -549,4 +590,162 @@ export async function removeOfflineMutation(id: string): Promise<void> {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+}
+
+export async function clearOfflineMutationQueue(): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const db = await openOfflineDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('syncQueue', 'readwrite');
+    tx.objectStore('syncQueue').clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function registerBackgroundSync(
+  tag = 'arraudhah-sync-queue'
+): Promise<boolean> {
+  if (
+    typeof navigator === 'undefined' ||
+    !('serviceWorker' in navigator)
+  ) {
+    return false;
+  }
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    const syncManager = (
+      registration as ServiceWorkerRegistration & {
+        sync?: { register: (t: string) => Promise<void> };
+      }
+    ).sync;
+    if (syncManager && typeof syncManager.register === 'function') {
+      await syncManager.register(tag);
+      return true;
+    }
+  } catch {
+    // Background Sync API not permitted or unsupported in current browser context
+  }
+  return false;
+}
+
+export async function getFirestoreSyncQueue(): Promise<FirestoreSyncItem[]> {
+  if (typeof indexedDB === 'undefined') return [];
+  const db = await openOfflineDb();
+  const rows = await new Promise<FirestoreSyncItem[]>((resolve, reject) => {
+    const tx = db.transaction('firestoreQueue', 'readonly');
+    const req = tx.objectStore('firestoreQueue').getAll();
+    req.onsuccess = () => resolve((req.result as FirestoreSyncItem[]) || []);
+    req.onerror = () => reject(req.error);
+  });
+  return rows.sort((a, b) => {
+    const prioDiff =
+      (COLLECTION_PRIORITY[a.collection] || 99) -
+      (COLLECTION_PRIORITY[b.collection] || 99);
+    if (prioDiff !== 0) return prioDiff;
+    return (a.createdAt || '').localeCompare(b.createdAt || '');
+  });
+}
+
+export async function enqueueFirestoreMutation(input: {
+  collection: FirestoreSyncCollection;
+  docId: string;
+  operation: 'upsert' | 'delete';
+  payload: Record<string, unknown>;
+  label: string;
+}): Promise<FirestoreSyncItem | null> {
+  if (typeof indexedDB === 'undefined') return null;
+  const db = await openOfflineDb();
+  const existing = await getFirestoreSyncQueue();
+  const now = new Date().toISOString();
+  const entry: FirestoreSyncItem = {
+    id: `fs_${input.collection}_${input.docId}`,
+    collection: input.collection,
+    docId: input.docId,
+    operation: input.operation,
+    payload: input.payload,
+    label: input.label,
+    status: 'pending',
+    retryCount: 0,
+    lastError: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('firestoreQueue', 'readwrite');
+    const store = tx.objectStore('firestoreQueue');
+    for (const old of existing) {
+      if (old.collection === input.collection && old.docId === input.docId) {
+        store.delete(old.id);
+      }
+    }
+    store.put(entry);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  void registerBackgroundSync('arraudhah-sync-queue');
+  return entry;
+}
+
+export async function updateFirestoreSyncItem(
+  id: string,
+  patch: Partial<Pick<FirestoreSyncItem, 'status' | 'retryCount' | 'lastError' | 'updatedAt'>>
+): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const db = await openOfflineDb();
+  const existing = await new Promise<FirestoreSyncItem | undefined>((resolve, reject) => {
+    const tx = db.transaction('firestoreQueue', 'readonly');
+    const req = tx.objectStore('firestoreQueue').get(id);
+    req.onsuccess = () => resolve(req.result as FirestoreSyncItem | undefined);
+    req.onerror = () => reject(req.error);
+  });
+  if (!existing) return;
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('firestoreQueue', 'readwrite');
+    tx.objectStore('firestoreQueue').put({
+      ...existing,
+      ...patch,
+      updatedAt: patch.updatedAt || new Date().toISOString(),
+    });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function removeFirestoreSyncItem(id: string): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const db = await openOfflineDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('firestoreQueue', 'readwrite');
+    tx.objectStore('firestoreQueue').delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function clearFirestoreSyncQueue(): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const db = await openOfflineDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('firestoreQueue', 'readwrite');
+    tx.objectStore('firestoreQueue').clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function resetFailedFirestoreItems(): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const items = await getFirestoreSyncQueue();
+  for (const item of items) {
+    if (item.status === 'failed' || item.status === 'syncing') {
+      await updateFirestoreSyncItem(item.id, {
+        status: 'pending',
+        lastError: null,
+      });
+    }
+  }
 }
