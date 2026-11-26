@@ -1,18 +1,22 @@
 import React, { useEffect, useState } from 'react';
-import { getDownloadURL, ref, uploadBytes } from 'firebase/storage';
-import { Building2, Save, Upload, ImageIcon, RotateCcw } from 'lucide-react';
-import { storage } from '../lib/firebase';
+import { Building2, Save, Upload, ImageIcon, RotateCcw, Trash2 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../components/Toast';
 import {
   BLUEPRINT_LIMITS,
-  INSTITUTION_DOC_ID,
   InstitutionProfile,
 } from '../types/models';
 import { sanitizeNumber, sanitizeString } from '../lib/formatters';
+import { isSafeImageUrl, processImageFileToDataUrl } from '../lib/imageUtils';
 
 export function InstitutionProfilePage() {
-  const { appUser, institution, institutionLoading, saveInstitution } = useAuth();
+  const {
+    appUser,
+    institution,
+    institutionLoading,
+    saveInstitution,
+    uploadInstitutionImage,
+  } = useAuth();
   const { showToast } = useToast();
 
   const canEdit = appUser?.role === 'Administrator';
@@ -74,6 +78,48 @@ export function InstitutionProfilePage() {
     }
   }, [institution]);
 
+  const buildSanitizedPayload = (overrides?: Partial<typeof form>): InstitutionProfile => {
+    const merged = { ...form, ...(overrides || {}) };
+    const cleanImageValue = (raw: string) => {
+      const trimmed = raw.trim();
+      if (!trimmed) return '';
+      if (!isSafeImageUrl(trimmed)) return '';
+      if (trimmed.startsWith('data:image/')) return trimmed;
+      return sanitizeString(trimmed, BLUEPRINT_LIMITS.institution.logoUrlMax);
+    };
+
+    return {
+      name: sanitizeString(merged.name, BLUEPRINT_LIMITS.institution.nameMax),
+      logoUrl: cleanImageValue(merged.logoUrl),
+      photoUrl: cleanImageValue(merged.photoUrl),
+      address: sanitizeString(merged.address, BLUEPRINT_LIMITS.institution.addressMax),
+      kecamatan: sanitizeString(merged.kecamatan, BLUEPRINT_LIMITS.institution.kecamatanMax),
+      kabupaten: sanitizeString(merged.kabupaten, BLUEPRINT_LIMITS.institution.kabupatenMax),
+      provinsi: sanitizeString(merged.provinsi, BLUEPRINT_LIMITS.institution.provinsiMax),
+      negara: sanitizeString(merged.negara, BLUEPRINT_LIMITS.institution.negaraMax),
+      phone: sanitizeString(merged.phone, BLUEPRINT_LIMITS.institution.phoneMax),
+      email: sanitizeString(merged.email, BLUEPRINT_LIMITS.institution.emailMax),
+      foundedYear: sanitizeString(merged.foundedYear, BLUEPRINT_LIMITS.institution.foundedYearMax),
+      statisticNumber: sanitizeString(
+        merged.statisticNumber,
+        BLUEPRINT_LIMITS.institution.statisticNumberMax
+      ),
+      legalityInfo: sanitizeString(merged.legalityInfo, BLUEPRINT_LIMITS.institution.legalityInfoMax),
+      leaderName: sanitizeString(merged.leaderName, BLUEPRINT_LIMITS.institution.leaderNameMax),
+      history: sanitizeString(merged.history, BLUEPRINT_LIMITS.institution.historyMax),
+      vision: sanitizeString(merged.vision, BLUEPRINT_LIMITS.institution.visionMax),
+      mission: sanitizeString(merged.mission, BLUEPRINT_LIMITS.institution.missionMax),
+      organizationStructure: sanitizeString(
+        merged.organizationStructure,
+        BLUEPRINT_LIMITS.institution.organizationStructureMax
+      ),
+      studentCount: sanitizeNumber(merged.studentCount, 0, 1000000),
+      teacherCount: sanitizeNumber(merged.teacherCount, 0, 1000000),
+      createdBy: institution?.createdBy || appUser?.uid || '',
+      updatedBy: appUser?.uid || '',
+    };
+  };
+
   const handleImageUpload = async (
     event: React.ChangeEvent<HTMLInputElement>,
     field: 'logoUrl' | 'photoUrl'
@@ -81,34 +127,43 @@ export function InstitutionProfilePage() {
     const file = event.target.files?.[0];
     if (!file || !canEdit) return;
 
-    if (!file.type.startsWith('image/')) {
-      showToast('Hanya berkas gambar (PNG, JPG, WebP) yang diperbolehkan.', 'error');
+    const allowedMime = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'];
+    if (!allowedMime.includes(file.type.toLowerCase())) {
+      showToast('Hanya berkas gambar PNG, JPG, atau WebP yang diperbolehkan.', 'error');
+      event.target.value = '';
       return;
     }
-    if (file.size > 3 * 1024 * 1024) {
-      showToast('Ukuran gambar maksimal 3 MB.', 'error');
-      return;
-    }
-
-    if (!navigator.onLine) {
-      showToast('Unggah berkas ke server membutuhkan koneksi internet, atau gunakan URL gambar.', 'error');
+    if (file.size > 5 * 1024 * 1024) {
+      showToast('Ukuran berkas sumber maksimal 5 MB.', 'error');
+      event.target.value = '';
       return;
     }
 
     setUploadingField(field);
     try {
-      const ext = file.name.split('.').pop() || 'png';
-      const storagePath = `institutions/${INSTITUTION_DOC_ID}/${field}-${Date.now()}.${ext}`;
-      const fileRef = ref(storage, storagePath);
-      await uploadBytes(fileRef, file);
-      const url = await getDownloadURL(fileRef);
-      setForm((prev) => ({ ...prev, [field]: url }));
+      const processedDataUrl = await processImageFileToDataUrl(
+        file,
+        field === 'logoUrl'
+          ? { maxDimension: 512, quality: 0.9, preserveAlpha: true }
+          : { maxDimension: 1280, quality: 0.84, preserveAlpha: false }
+      );
+
+      const basePayload = buildSanitizedPayload({ [field]: processedDataUrl });
+      const result = await uploadInstitutionImage(field, processedDataUrl, basePayload);
+
+      setForm((prev) => ({ ...prev, [field]: result.url }));
       if (field === 'logoUrl') setLogoImgError(false);
       else setPhotoImgError(false);
-      showToast('Gambar berhasil diunggah. Klik Simpan Profil Lembaga untuk menyimpan.', 'info');
-    } catch {
+
       showToast(
-        'Unggah ke Firebase Storage gagal. Anda tetap dapat memasukkan tautan URL gambar secara manual.',
+        result.queuedOffline
+          ? `${field === 'logoUrl' ? 'Logo' : 'Foto'} lembaga disimpan secara lokal dan akan otomatis tersinkron saat internet terhubung.`
+          : `${field === 'logoUrl' ? 'Logo' : 'Foto'} lembaga berhasil diunggah dan tersimpan.`,
+        result.queuedOffline ? 'info' : 'success'
+      );
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : 'Gagal memproses atau mengunggah berkas gambar.',
         'error'
       );
     } finally {
@@ -121,36 +176,18 @@ export function InstitutionProfilePage() {
     e.preventDefault();
     if (!appUser || !canEdit) return;
 
+    if (form.logoUrl.trim() && !isSafeImageUrl(form.logoUrl)) {
+      showToast('URL Logo Lembaga harus diawali http://, https://, atau berupa gambar unggahan.', 'error');
+      return;
+    }
+    if (form.photoUrl.trim() && !isSafeImageUrl(form.photoUrl)) {
+      showToast('URL Foto Lembaga harus diawali http://, https://, atau berupa gambar unggahan.', 'error');
+      return;
+    }
+
     setSaving(true);
     try {
-      const payload: InstitutionProfile = {
-        name: sanitizeString(form.name, BLUEPRINT_LIMITS.institution.nameMax),
-        logoUrl: sanitizeString(form.logoUrl, BLUEPRINT_LIMITS.institution.logoUrlMax),
-        photoUrl: sanitizeString(form.photoUrl, BLUEPRINT_LIMITS.institution.photoUrlMax),
-        address: sanitizeString(form.address, BLUEPRINT_LIMITS.institution.addressMax),
-        kecamatan: sanitizeString(form.kecamatan, BLUEPRINT_LIMITS.institution.kecamatanMax),
-        kabupaten: sanitizeString(form.kabupaten, BLUEPRINT_LIMITS.institution.kabupatenMax),
-        provinsi: sanitizeString(form.provinsi, BLUEPRINT_LIMITS.institution.provinsiMax),
-        negara: sanitizeString(form.negara, BLUEPRINT_LIMITS.institution.negaraMax),
-        phone: sanitizeString(form.phone, BLUEPRINT_LIMITS.institution.phoneMax),
-        email: sanitizeString(form.email, BLUEPRINT_LIMITS.institution.emailMax),
-        foundedYear: sanitizeString(form.foundedYear, BLUEPRINT_LIMITS.institution.foundedYearMax),
-        statisticNumber: sanitizeString(form.statisticNumber, BLUEPRINT_LIMITS.institution.statisticNumberMax),
-        legalityInfo: sanitizeString(form.legalityInfo, BLUEPRINT_LIMITS.institution.legalityInfoMax),
-        leaderName: sanitizeString(form.leaderName, BLUEPRINT_LIMITS.institution.leaderNameMax),
-        history: sanitizeString(form.history, BLUEPRINT_LIMITS.institution.historyMax),
-        vision: sanitizeString(form.vision, BLUEPRINT_LIMITS.institution.visionMax),
-        mission: sanitizeString(form.mission, BLUEPRINT_LIMITS.institution.missionMax),
-        organizationStructure: sanitizeString(
-          form.organizationStructure,
-          BLUEPRINT_LIMITS.institution.organizationStructureMax
-        ),
-        studentCount: sanitizeNumber(form.studentCount, 0, 1000000),
-        teacherCount: sanitizeNumber(form.teacherCount, 0, 1000000),
-        createdBy: institution?.createdBy || appUser.uid,
-        updatedBy: appUser.uid,
-      };
-
+      const payload = buildSanitizedPayload();
       const { queuedOffline } = await saveInstitution(payload);
       if (queuedOffline) {
         showToast(
@@ -175,6 +212,11 @@ export function InstitutionProfilePage() {
       </div>
     );
   }
+
+  const safeLogoPreview = isSafeImageUrl(form.logoUrl) ? form.logoUrl : '';
+  const safePhotoPreview = isSafeImageUrl(form.photoUrl) ? form.photoUrl : '';
+  const isLocalLogoData = form.logoUrl.startsWith('data:image/');
+  const isLocalPhotoData = form.photoUrl.startsWith('data:image/');
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
@@ -242,13 +284,13 @@ export function InstitutionProfilePage() {
         <section className="rounded-xl border border-slate-200 bg-white p-6">
           <h3 className="font-display text-sm font-semibold text-[#111C18]">Logo Lembaga</h3>
           <p className="mt-1 text-xs text-slate-500">
-            Ditampilkan pada halaman muka, kop surat proposal, dan hasil ekspor dokumen.
+            Dapat diunggah kapan saja (online maupun offline) dan otomatis disinkronkan saat terhubung ke internet.
           </p>
           <div className="mt-4 flex flex-col gap-4 sm:flex-row sm:items-center">
             <div className="flex h-24 w-24 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-50 p-2">
-              {form.logoUrl && !logoImgError ? (
+              {safeLogoPreview && !logoImgError ? (
                 <img
-                  src={form.logoUrl}
+                  src={safeLogoPreview}
                   alt="Logo Lembaga"
                   referrerPolicy="no-referrer"
                   onError={() => setLogoImgError(true)}
@@ -260,42 +302,65 @@ export function InstitutionProfilePage() {
             </div>
             <div className="flex-1 space-y-2.5">
               {canEdit && (
-                <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50">
-                  <Upload className="h-3.5 w-3.5 text-[#0F3D2E]" />
-                  <span>{uploadingField === 'logoUrl' ? 'Mengunggah...' : 'Unggah File Logo'}</span>
-                  <input
-                    type="file"
-                    accept="image/*"
-                    disabled={uploadingField !== null}
-                    onChange={(e) => handleImageUpload(e, 'logoUrl')}
-                    className="hidden"
-                  />
-                </label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50">
+                    <Upload className="h-3.5 w-3.5 text-[#0F3D2E]" />
+                    <span>{uploadingField === 'logoUrl' ? 'Memproses...' : 'Unggah File Logo'}</span>
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp"
+                      disabled={uploadingField !== null}
+                      onChange={(e) => handleImageUpload(e, 'logoUrl')}
+                      className="hidden"
+                    />
+                  </label>
+                  {form.logoUrl && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLogoImgError(false);
+                        setForm({ ...form, logoUrl: '' });
+                      }}
+                      className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-medium text-red-600 hover:bg-red-50"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Hapus
+                    </button>
+                  )}
+                </div>
               )}
-              <input
-                type="url"
-                value={form.logoUrl}
-                disabled={!canEdit}
-                onChange={(e) => {
-                  setLogoImgError(false);
-                  setForm({ ...form, logoUrl: e.target.value });
-                }}
-                placeholder="Atau tempel URL gambar logo (opsional)"
-                maxLength={BLUEPRINT_LIMITS.institution.logoUrlMax}
-                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none disabled:bg-slate-50"
-              />
+              {isLocalLogoData ? (
+                <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+                  Logo tersimpan lokal pada perangkat ini (siap disinkronkan otomatis saat online).
+                </p>
+              ) : (
+                <input
+                  type="text"
+                  value={form.logoUrl}
+                  disabled={!canEdit}
+                  onChange={(e) => {
+                    setLogoImgError(false);
+                    setForm({ ...form, logoUrl: e.target.value });
+                  }}
+                  placeholder="Atau tempel URL gambar logo (opsional)"
+                  maxLength={BLUEPRINT_LIMITS.institution.logoUrlMax}
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none disabled:bg-slate-50"
+                />
+              )}
             </div>
           </div>
         </section>
 
         <section className="rounded-xl border border-slate-200 bg-white p-6">
           <h3 className="font-display text-sm font-semibold text-[#111C18]">Foto Lembaga</h3>
-          <p className="mt-1 text-xs text-slate-500">Foto gedung atau aktivitas utama lembaga.</p>
+          <p className="mt-1 text-xs text-slate-500">
+            Foto gedung atau aktivitas utama lembaga (PNG, JPG, WebP · otomatis dioptimalkan).
+          </p>
           <div className="mt-4 flex flex-col gap-4 sm:flex-row sm:items-center">
             <div className="flex h-24 w-36 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
-              {form.photoUrl && !photoImgError ? (
+              {safePhotoPreview && !photoImgError ? (
                 <img
-                  src={form.photoUrl}
+                  src={safePhotoPreview}
                   alt="Foto Lembaga"
                   referrerPolicy="no-referrer"
                   onError={() => setPhotoImgError(true)}
@@ -310,30 +375,51 @@ export function InstitutionProfilePage() {
             </div>
             <div className="flex-1 space-y-2.5">
               {canEdit && (
-                <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50">
-                  <Upload className="h-3.5 w-3.5 text-[#0F3D2E]" />
-                  <span>{uploadingField === 'photoUrl' ? 'Mengunggah...' : 'Unggah Foto Lembaga'}</span>
-                  <input
-                    type="file"
-                    accept="image/*"
-                    disabled={uploadingField !== null}
-                    onChange={(e) => handleImageUpload(e, 'photoUrl')}
-                    className="hidden"
-                  />
-                </label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50">
+                    <Upload className="h-3.5 w-3.5 text-[#0F3D2E]" />
+                    <span>{uploadingField === 'photoUrl' ? 'Memproses...' : 'Unggah Foto Lembaga'}</span>
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp"
+                      disabled={uploadingField !== null}
+                      onChange={(e) => handleImageUpload(e, 'photoUrl')}
+                      className="hidden"
+                    />
+                  </label>
+                  {form.photoUrl && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPhotoImgError(false);
+                        setForm({ ...form, photoUrl: '' });
+                      }}
+                      className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-medium text-red-600 hover:bg-red-50"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Hapus
+                    </button>
+                  )}
+                </div>
               )}
-              <input
-                type="url"
-                value={form.photoUrl}
-                disabled={!canEdit}
-                onChange={(e) => {
-                  setPhotoImgError(false);
-                  setForm({ ...form, photoUrl: e.target.value });
-                }}
-                placeholder="Atau tempel URL foto lembaga (opsional)"
-                maxLength={BLUEPRINT_LIMITS.institution.photoUrlMax}
-                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none disabled:bg-slate-50"
-              />
+              {isLocalPhotoData ? (
+                <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+                  Foto lembaga tersimpan lokal pada perangkat ini (siap disinkronkan otomatis saat online).
+                </p>
+              ) : (
+                <input
+                  type="text"
+                  value={form.photoUrl}
+                  disabled={!canEdit}
+                  onChange={(e) => {
+                    setPhotoImgError(false);
+                    setForm({ ...form, photoUrl: e.target.value });
+                  }}
+                  placeholder="Atau tempel URL foto lembaga (opsional)"
+                  maxLength={BLUEPRINT_LIMITS.institution.photoUrlMax}
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none disabled:bg-slate-50"
+                />
+              )}
             </div>
           </div>
         </section>

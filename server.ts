@@ -14,6 +14,7 @@ const ENV_ADMIN_PASSCODE = (process.env.ADMIN_PASSCODE || '').trim();
 const TOKEN_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
+const UPLOADS_DIR = path.resolve(DATA_DIR, 'uploads');
 const STORE_FILE = path.join(DATA_DIR, 'arraudhah-store.json');
 
 type UserRole = 'Administrator' | 'Pimpinan' | 'Operator';
@@ -30,6 +31,8 @@ interface StoredUser {
   status: UserStatus;
   passwordSalt: string;
   passwordHash: string;
+  recoverySalt?: string;
+  recoveryHash?: string;
   createdAt: string;
   updatedAt: string;
   createdBy: string;
@@ -219,6 +222,87 @@ function sanitizeNum(value: unknown, min = 0, max = 1000000): number {
   return Math.max(min, Math.min(max, Math.floor(num)));
 }
 
+function saveBase64ImageToUploads(
+  dataUrl: string,
+  field: 'logoUrl' | 'photoUrl'
+): string {
+  const match = /^data:image\/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)$/i.exec(
+    dataUrl.trim()
+  );
+  if (!match) {
+    throw new Error('Format berkas gambar tidak didukung. Gunakan PNG, JPG, atau WebP.');
+  }
+
+  const subtype = match[1].toLowerCase();
+  const base64Body = match[2];
+  const buffer = Buffer.from(base64Body, 'base64');
+
+  if (buffer.length === 0 || buffer.length > 2 * 1024 * 1024) {
+    throw new Error('Ukuran gambar melebihi batas maksimal 2 MB.');
+  }
+
+  // Verify magic bytes for PNG, JPEG, or WebP
+  const isPng =
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47;
+  const isJpeg =
+    buffer.length >= 3 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff;
+  const isWebp =
+    buffer.length >= 12 &&
+    buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+
+  if (
+    (subtype === 'png' && !isPng) ||
+    ((subtype === 'jpeg' || subtype === 'jpg') && !isJpeg) ||
+    (subtype === 'webp' && !isWebp)
+  ) {
+    throw new Error('Isi berkas gambar tidak sesuai dengan format gambar yang dipilih.');
+  }
+
+  const ext = subtype === 'jpeg' ? 'jpg' : subtype;
+  const safePrefix = field === 'logoUrl' ? 'logo' : 'foto';
+  const filename = `${safePrefix}-${Date.now()}-${crypto.randomUUID()}.${ext}`;
+
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  const targetPath = path.resolve(UPLOADS_DIR, filename);
+  if (!targetPath.startsWith(UPLOADS_DIR + path.sep)) {
+    throw new Error('Lokasi penyimpanan berkas tidak valid.');
+  }
+  fs.writeFileSync(targetPath, buffer);
+  return `/api/uploads/${filename}`;
+}
+
+function resolveInstitutionImageField(
+  rawValue: unknown,
+  field: 'logoUrl' | 'photoUrl'
+): string {
+  if (typeof rawValue !== 'string') return '';
+  const trimmed = rawValue.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('data:image/')) {
+    return saveBase64ImageToUploads(trimmed, field);
+  }
+  if (trimmed.startsWith('/api/uploads/')) {
+    return trimmed.slice(0, 500);
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return trimmed.slice(0, 2000);
+    }
+  } catch {
+    return '';
+  }
+  return '';
+}
+
 function toPublicUser(u: StoredUser) {
   return {
     uid: u.uid,
@@ -229,6 +313,7 @@ function toPublicUser(u: StoredUser) {
     position: u.position,
     role: u.role,
     status: u.status,
+    hasRecoveryCode: Boolean(u.recoveryHash),
     createdAt: u.createdAt,
     updatedAt: u.updatedAt,
     createdBy: u.createdBy,
@@ -319,10 +404,34 @@ function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '6mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  app.get('/api/uploads/:filename', (req, res) => {
+    const filename = req.params.filename || '';
+    if (!/^[a-zA-Z0-9_-]+\.(png|jpg|jpeg|webp)$/i.test(filename)) {
+      res.status(400).json({ error: 'Nama berkas tidak valid.' });
+      return;
+    }
+    const targetPath = path.resolve(UPLOADS_DIR, filename);
+    if (!targetPath.startsWith(UPLOADS_DIR + path.sep) || !fs.existsSync(targetPath)) {
+      res.status(404).json({ error: 'Berkas gambar tidak ditemukan.' });
+      return;
+    }
+    const ext = path.extname(filename).toLowerCase();
+    const contentType =
+      ext === '.png'
+        ? 'image/png'
+        : ext === '.webp'
+        ? 'image/webp'
+        : 'image/jpeg';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'public, max-age=31536000');
+    res.sendFile(targetPath);
   });
 
   // 1. Bootstrap status (first-run admin claim check)
@@ -354,6 +463,8 @@ async function startServer() {
     const username = sanitizeStr(req.body?.username, 80);
     const displayName = sanitizeStr(req.body?.displayName || username, 150);
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const recoveryCode =
+      typeof req.body?.recoveryCode === 'string' ? req.body.recoveryCode.trim() : '';
 
     if (username.length < 3 || !/^[a-zA-Z0-9_.\- ]+$/.test(username)) {
       res.status(400).json({
@@ -365,10 +476,15 @@ async function startServer() {
       res.status(400).json({ error: 'Kata sandi harus terdiri dari 6 hingga 128 karakter.' });
       return;
     }
+    if (recoveryCode && (recoveryCode.length < 4 || recoveryCode.length > 64)) {
+      res.status(400).json({ error: 'Kode pemulihan akun harus terdiri dari 4 hingga 64 karakter.' });
+      return;
+    }
 
     const now = new Date().toISOString();
     const uid = `usr_${crypto.randomUUID()}`;
     const { salt, hash } = hashPassword(password);
+    const recovery = recoveryCode ? hashPassword(recoveryCode) : null;
 
     const adminUser: StoredUser = {
       uid,
@@ -381,6 +497,7 @@ async function startServer() {
       status: 'active',
       passwordSalt: salt,
       passwordHash: hash,
+      ...(recovery ? { recoverySalt: recovery.salt, recoveryHash: recovery.hash } : {}),
       createdAt: now,
       updatedAt: now,
       createdBy: uid,
@@ -489,6 +606,8 @@ async function startServer() {
     const username = sanitizeStr(req.body?.username, 80);
     const displayName = sanitizeStr(req.body?.displayName || username, 150);
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const recoveryCode =
+      typeof req.body?.recoveryCode === 'string' ? req.body.recoveryCode.trim() : '';
 
     if (username.length < 3 || !/^[a-zA-Z0-9_.\- ]+$/.test(username)) {
       res.status(400).json({
@@ -498,6 +617,10 @@ async function startServer() {
     }
     if (password.length < 6 || password.length > 128) {
       res.status(400).json({ error: 'Kata sandi minimal 6 karakter.' });
+      return;
+    }
+    if (recoveryCode && (recoveryCode.length < 4 || recoveryCode.length > 64)) {
+      res.status(400).json({ error: 'Kode pemulihan akun minimal 4 karakter.' });
       return;
     }
 
@@ -513,6 +636,7 @@ async function startServer() {
     const now = new Date().toISOString();
     const uid = `usr_${crypto.randomUUID()}`;
     const { salt, hash } = hashPassword(password);
+    const recovery = recoveryCode ? hashPassword(recoveryCode) : null;
 
     const newUser: StoredUser = {
       uid,
@@ -525,6 +649,7 @@ async function startServer() {
       status: 'pending',
       passwordSalt: salt,
       passwordHash: hash,
+      ...(recovery ? { recoverySalt: recovery.salt, recoveryHash: recovery.hash } : {}),
       createdAt: now,
       updatedAt: now,
       createdBy: uid,
@@ -537,6 +662,140 @@ async function startServer() {
     res.status(201).json({
       message: 'Pendaftaran berhasil. Akun berstatus Menunggu Aktivasi dari Administrator.',
       user: toPublicUser(newUser),
+    });
+  });
+
+  // 4b. Recover forgotten username by verifying displayName + password or recoveryCode
+  app.post('/api/auth/recover-username', (req, res) => {
+    const displayName = sanitizeStr(req.body?.displayName, 150);
+    const secret = typeof req.body?.secret === 'string' ? req.body.secret : '';
+
+    if (!displayName || !secret) {
+      res.status(400).json({
+        error: 'Nama lengkap dan kata sandi (atau kode pemulihan) wajib diisi.',
+      });
+      return;
+    }
+
+    const store = readStore();
+    const candidates = store.users.filter(
+      (u) => u.displayName.trim().toLowerCase() === displayName.toLowerCase()
+    );
+
+    const matched = candidates.find(
+      (u) =>
+        verifyPassword(secret, u.passwordSalt, u.passwordHash) ||
+        (u.recoverySalt &&
+          u.recoveryHash &&
+          verifyPassword(secret.trim(), u.recoverySalt, u.recoveryHash))
+    );
+
+    if (!matched) {
+      res.status(401).json({
+        error: 'Data nama lengkap atau kata sandi/kode pemulihan tidak cocok.',
+      });
+      return;
+    }
+
+    res.json({
+      username: matched.username,
+      displayName: matched.displayName,
+    });
+  });
+
+  // 4c. Reset forgotten password or username using account recovery code or server ADMIN_PASSCODE
+  app.post('/api/auth/reset-account', (req, res) => {
+    const identifier = sanitizeStr(req.body?.identifier, 150);
+    const recoveryCode =
+      typeof req.body?.recoveryCode === 'string' ? req.body.recoveryCode.trim() : '';
+    const newUsername = sanitizeStr(req.body?.newUsername, 80);
+    const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+
+    if (!identifier || !recoveryCode || !newPassword) {
+      res.status(400).json({
+        error: 'Nama pengguna/nama lengkap, kode pemulihan, dan kata sandi baru wajib diisi.',
+      });
+      return;
+    }
+
+    if (newPassword.length < 6 || newPassword.length > 128) {
+      res.status(400).json({ error: 'Kata sandi baru minimal 6 karakter.' });
+      return;
+    }
+
+    if (newUsername && (newUsername.length < 3 || !/^[a-zA-Z0-9_.\- ]+$/.test(newUsername))) {
+      res.status(400).json({
+        error: 'Nama pengguna baru minimal 3 karakter (huruf, angka, spasi, titik, garis bawah, atau tanda hubung).',
+      });
+      return;
+    }
+
+    const store = readStore();
+    const lowered = identifier.toLowerCase();
+    const target =
+      store.users.find((u) => u.username.toLowerCase() === lowered) ||
+      (() => {
+        const byDisplay = store.users.filter(
+          (u) => u.displayName.trim().toLowerCase() === lowered
+        );
+        return byDisplay.length === 1 ? byDisplay[0] : undefined;
+      })();
+
+    if (!target) {
+      res.status(404).json({
+        error: 'Akun tidak ditemukan. Periksa kembali nama pengguna atau nama lengkap Anda.',
+      });
+      return;
+    }
+
+    const validUserRecovery =
+      Boolean(target.recoverySalt && target.recoveryHash) &&
+      verifyPassword(recoveryCode, target.recoverySalt!, target.recoveryHash!);
+    const validServerOverride = verifyEnvPasscode(recoveryCode);
+
+    if (!validUserRecovery && !validServerOverride) {
+      res.status(403).json({
+        error:
+          'Kode pemulihan tidak sesuai atau belum diatur pada akun ini. Hubungi Administrator untuk reset manual melalui Manajemen Pengguna.',
+      });
+      return;
+    }
+
+    if (
+      newUsername &&
+      store.users.some(
+        (u) => u.uid !== target.uid && u.username.toLowerCase() === newUsername.toLowerCase()
+      )
+    ) {
+      res.status(409).json({
+        error: 'Nama pengguna baru sudah digunakan akun lain. Pilih nama lain.',
+      });
+      return;
+    }
+
+    if (newUsername) {
+      target.username = newUsername;
+    }
+    const { salt, hash } = hashPassword(newPassword);
+    target.passwordSalt = salt;
+    target.passwordHash = hash;
+    target.updatedAt = new Date().toISOString();
+    target.updatedBy = target.uid;
+
+    appendAudit(store, {
+      action: 'USER_ACCOUNT_RESET',
+      entityType: 'users',
+      entityId: target.uid,
+      actorUid: target.uid,
+      actorName: target.displayName,
+      details: `Reset akun mandiri untuk ${target.username}.`,
+    });
+    writeStore(store);
+
+    res.json({
+      ok: true,
+      username: target.username,
+      message: `Akun ${target.username} berhasil direset. Silakan masuk dengan kredensial baru.`,
     });
   });
 
@@ -589,6 +848,17 @@ async function startServer() {
       target.passwordHash = hash;
     }
 
+    if (typeof req.body?.recoveryCode === 'string' && req.body.recoveryCode.trim().length > 0) {
+      const code = req.body.recoveryCode.trim();
+      if (code.length < 4 || code.length > 64) {
+        res.status(400).json({ error: 'Kode pemulihan harus 4 hingga 64 karakter.' });
+        return;
+      }
+      const recovery = hashPassword(code);
+      target.recoverySalt = recovery.salt;
+      target.recoveryHash = recovery.hash;
+    }
+
     target.updatedAt = new Date().toISOString();
     target.updatedBy = actor.uid;
     writeStore(store);
@@ -596,10 +866,48 @@ async function startServer() {
     res.json({ user: toPublicUser(target) });
   });
 
-  // 6. Institution Profile
+  // 6. Institution Profile & Image Uploads
   app.get('/api/institution', requireAuth, (_req, res) => {
     const store = readStore();
     res.json({ institution: store.institution });
+  });
+
+  app.post('/api/institution/upload', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    const field = req.body?.field === 'logoUrl' ? 'logoUrl' : req.body?.field === 'photoUrl' ? 'photoUrl' : null;
+    const dataUrl = typeof req.body?.dataUrl === 'string' ? req.body.dataUrl : '';
+
+    if (!field || !dataUrl) {
+      res.status(400).json({ error: 'Berkas gambar dan jenis target wajib diisi.' });
+      return;
+    }
+
+    try {
+      const uploadedUrl = saveBase64ImageToUploads(dataUrl, field);
+      const store = readStore();
+      const now = new Date().toISOString();
+      store.institution[field] = uploadedUrl;
+      store.institution.createdAt = store.institution.createdAt || now;
+      store.institution.createdBy = store.institution.createdBy || actor.uid;
+      store.institution.updatedAt = now;
+      store.institution.updatedBy = actor.uid;
+
+      appendAudit(store, {
+        action: 'INSTITUTION_IMAGE_UPLOAD',
+        entityType: 'institutions',
+        entityId: 'ar-raudhah',
+        actorUid: actor.uid,
+        actorName: actor.displayName,
+        details: `Mengunggah ${field === 'logoUrl' ? 'Logo Lembaga' : 'Foto Lembaga'}.`,
+      });
+      writeStore(store);
+
+      res.json({ url: uploadedUrl, institution: store.institution });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Gagal memproses berkas gambar.',
+      });
+    }
   });
 
   app.put('/api/institution', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
@@ -608,10 +916,22 @@ async function startServer() {
     const now = new Date().toISOString();
     const body = req.body || {};
 
+    let resolvedLogoUrl = '';
+    let resolvedPhotoUrl = '';
+    try {
+      resolvedLogoUrl = resolveInstitutionImageField(body.logoUrl, 'logoUrl');
+      resolvedPhotoUrl = resolveInstitutionImageField(body.photoUrl, 'photoUrl');
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Format logo atau foto lembaga tidak valid.',
+      });
+      return;
+    }
+
     const updated: StoredInstitution = {
       name: sanitizeStr(body.name, 200),
-      logoUrl: sanitizeStr(body.logoUrl, 2000),
-      photoUrl: sanitizeStr(body.photoUrl, 2000),
+      logoUrl: resolvedLogoUrl,
+      photoUrl: resolvedPhotoUrl,
       address: sanitizeStr(body.address, 500),
       kecamatan: sanitizeStr(body.kecamatan, 120),
       kabupaten: sanitizeStr(body.kabupaten, 120),
@@ -734,6 +1054,25 @@ async function startServer() {
       return;
     }
 
+    const requestedUsername = sanitizeStr(req.body?.username, 80);
+    if (requestedUsername) {
+      if (requestedUsername.length < 3 || !/^[a-zA-Z0-9_.\- ]+$/.test(requestedUsername)) {
+        res.status(400).json({
+          error: 'Nama pengguna minimal 3 karakter (huruf, angka, spasi, titik, garis bawah, atau tanda hubung).',
+        });
+        return;
+      }
+      if (
+        store.users.some(
+          (u) => u.uid !== target.uid && u.username.toLowerCase() === requestedUsername.toLowerCase()
+        )
+      ) {
+        res.status(409).json({ error: 'Nama pengguna tersebut sudah digunakan akun lain.' });
+        return;
+      }
+      target.username = requestedUsername;
+    }
+
     const nextRole: UserRole = ['Administrator', 'Pimpinan', 'Operator'].includes(req.body?.role)
       ? req.body.role
       : target.role;
@@ -760,6 +1099,17 @@ async function startServer() {
       const { salt, hash } = hashPassword(req.body.newPassword);
       target.passwordSalt = salt;
       target.passwordHash = hash;
+    }
+
+    if (typeof req.body?.recoveryCode === 'string' && req.body.recoveryCode.trim().length > 0) {
+      const code = req.body.recoveryCode.trim();
+      if (code.length < 4 || code.length > 64) {
+        res.status(400).json({ error: 'Kode pemulihan minimal 4 karakter.' });
+        return;
+      }
+      const recovery = hashPassword(code);
+      target.recoverySalt = recovery.salt;
+      target.recoveryHash = recovery.hash;
     }
 
     target.updatedAt = new Date().toISOString();

@@ -69,19 +69,23 @@ export function UsersManagementPage() {
 
   const [editingUser, setEditingUser] = useState<AppUser | null>(null);
   const [editForm, setEditForm] = useState<{
+    username: string;
     displayName: string;
     phone: string;
     position: string;
     role: UserRole;
     status: UserStatus;
     newPassword: string;
+    recoveryCode: string;
   }>({
+    username: '',
     displayName: '',
     phone: '',
     position: '',
     role: 'Operator',
     status: 'pending',
     newPassword: '',
+    recoveryCode: '',
   });
   const [savingEdit, setSavingEdit] = useState(false);
 
@@ -247,12 +251,14 @@ export function UsersManagementPage() {
   const openEditModal = (user: AppUser) => {
     setEditingUser(user);
     setEditForm({
+      username: user.username || user.displayName,
       displayName: user.displayName,
       phone: user.phone || '',
       position: user.position || '',
       role: user.role,
       status: user.status,
       newPassword: '',
+      recoveryCode: '',
     });
   };
 
@@ -260,12 +266,24 @@ export function UsersManagementPage() {
     e.preventDefault();
     if (!editingUser || !appUser || !canMutate) return;
 
+    const cleanUsername = editForm.username.trim();
+    if (cleanUsername.length < 3) {
+      showToast('Nama pengguna minimal 3 karakter.', 'error');
+      return;
+    }
+
     const cleanName = sanitizeString(
       editForm.displayName,
       BLUEPRINT_LIMITS.user.displayNameMax
     );
     if (!cleanName) {
       showToast('Nama tampilan wajib diisi.', 'error');
+      return;
+    }
+
+    const cleanRecovery = editForm.recoveryCode.trim();
+    if (cleanRecovery && cleanRecovery.length < 4) {
+      showToast('Kode pemulihan minimal 4 karakter jika diisi.', 'error');
       return;
     }
 
@@ -278,18 +296,21 @@ export function UsersManagementPage() {
         await apiRequest(`/api/users/${editingUser.uid}`, {
           method: 'PATCH',
           body: {
+            username: cleanUsername,
             displayName: cleanName,
             phone: cleanPhone,
             position: cleanPosition,
             role: editForm.role,
             status: editForm.status,
             newPassword: editForm.newPassword || undefined,
+            recoveryCode: cleanRecovery || undefined,
           },
         });
       } else {
         await updateOfflineAuthUserMetadata(
           editingUser.uid,
           {
+            username: cleanUsername,
             displayName: cleanName,
             phone: cleanPhone,
             position: cleanPosition,
@@ -297,17 +318,20 @@ export function UsersManagementPage() {
             status: editForm.status,
             updatedBy: appUser.uid,
           },
-          editForm.newPassword || undefined
+          editForm.newPassword || undefined,
+          cleanRecovery || undefined
         );
         const nextList = users.map((u) =>
           u.uid === editingUser.uid
             ? {
                 ...u,
+                username: cleanUsername,
                 displayName: cleanName,
                 phone: cleanPhone,
                 position: cleanPosition,
                 role: editForm.role,
                 status: editForm.status,
+                hasRecoveryCode: Boolean(u.hasRecoveryCode || cleanRecovery),
                 updatedAt: new Date().toISOString(),
                 updatedBy: appUser.uid,
               }
@@ -316,7 +340,7 @@ export function UsersManagementPage() {
         await setOfflineKV('users', nextList);
       }
 
-      showToast(`Data pengguna ${cleanName} berhasil diperbarui.`, 'success');
+      showToast(`Data pengguna ${cleanName} (@${cleanUsername}) berhasil diperbarui.`, 'success');
       setEditingUser(null);
       await loadUsers();
     } catch (err) {
@@ -723,10 +747,10 @@ export function UsersManagementPage() {
           role="dialog"
           aria-modal="true"
         >
-          <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 shadow-lg">
+          <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-slate-200 bg-white p-6 shadow-lg">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-base font-bold text-[#111C18]">
-                Ubah Akses Pengguna
+                Ubah & Reset Akun Pengguna
               </h3>
               <button
                 type="button"
@@ -739,12 +763,16 @@ export function UsersManagementPage() {
 
             <form onSubmit={handleSaveUser} className="mt-5 space-y-4">
               <div>
-                <label className="block text-xs font-medium text-slate-700">Nama Pengguna</label>
+                <label className="block text-xs font-medium text-slate-700">
+                  Nama Pengguna (Username untuk Masuk)
+                </label>
                 <input
                   type="text"
-                  disabled
-                  value={editingUser.username || editingUser.displayName}
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-sm text-slate-500"
+                  required
+                  minLength={3}
+                  value={editForm.username}
+                  onChange={(e) => setEditForm({ ...editForm, username: e.target.value })}
+                  className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 font-mono text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
                 />
               </div>
 
@@ -813,18 +841,36 @@ export function UsersManagementPage() {
                 />
               </div>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-700">
-                  Atur Ulang Kata Sandi (Opsional)
-                </label>
-                <input
-                  type="password"
-                  minLength={6}
-                  value={editForm.newPassword}
-                  onChange={(e) => setEditForm({ ...editForm, newPassword: e.target.value })}
-                  placeholder="Kosongkan jika tidak mengubah sandi"
-                  className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
-                />
+              <div className="grid grid-cols-1 gap-3 border-t border-slate-100 pt-3 sm:grid-cols-2">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700">
+                    Reset Kata Sandi (Opsional)
+                  </label>
+                  <input
+                    type="password"
+                    minLength={6}
+                    value={editForm.newPassword}
+                    onChange={(e) => setEditForm({ ...editForm, newPassword: e.target.value })}
+                    placeholder="Kosongkan jika tetap"
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700">
+                    Kode Pemulihan Baru
+                  </label>
+                  <input
+                    type="text"
+                    minLength={4}
+                    maxLength={64}
+                    value={editForm.recoveryCode}
+                    onChange={(e) => setEditForm({ ...editForm, recoveryCode: e.target.value })}
+                    placeholder={
+                      editingUser.hasRecoveryCode ? 'Sudah diatur (ganti?)' : 'Opsional · min 4 kar'
+                    }
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                  />
+                </div>
               </div>
 
               <div className="flex justify-end gap-2.5 pt-2">

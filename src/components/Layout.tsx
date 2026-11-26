@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, NavLink, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard,
@@ -22,6 +22,7 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import { PWAInstallButton } from './PWAInstallButton';
 import { OfflineIndicator } from './OfflineIndicator';
+import { isSafeImageUrl } from '../lib/imageUtils';
 
 interface NavItem {
   label: string;
@@ -99,9 +100,14 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const [logoFailed, setLogoFailed] = useState(false);
   const location = useLocation();
 
+  useEffect(() => {
+    setLogoFailed(false);
+  }, [institution?.logoUrl]);
+
   const currentTitle = ROUTE_TITLES[location.pathname] || 'Sistem Manajemen Proposal';
   const institutionName = institution?.name?.trim() || 'Profil Lembaga Belum Diisi';
-  const logoSrc = !logoFailed && institution?.logoUrl ? institution.logoUrl : '';
+  const logoSrc =
+    !logoFailed && isSafeImageUrl(institution?.logoUrl) ? institution!.logoUrl! : '';
 
   const renderNavContent = () => (
     <div className="flex h-full flex-col bg-[#0F3D2E] text-white">

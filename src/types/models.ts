@@ -52,6 +52,7 @@ export interface AppUser {
   position?: string;
   role: UserRole;
   status: UserStatus;
+  hasRecoveryCode?: boolean;
   createdAt?: unknown;
   updatedAt?: unknown;
   createdBy: string;

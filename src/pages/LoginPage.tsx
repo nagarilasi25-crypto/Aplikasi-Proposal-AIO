@@ -4,22 +4,27 @@ import {
   Building2,
   CheckCircle2,
   Clock,
+  KeyRound,
   LogIn,
   LogOut,
+  RotateCcw,
   ShieldCheck,
   UserPlus,
+  UserSearch,
   WifiOff,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 
-type AuthMode = 'login' | 'register';
+type AuthMode = 'login' | 'register' | 'recover';
+type RecoverTab = 'username' | 'reset';
 
 export function LoginPage() {
   const {
     signingIn,
     needsSetup,
+    hasEnvAdminPasscode,
     pendingStatusUser,
     authError,
     authNotice,
@@ -27,15 +32,40 @@ export function LoginPage() {
     setupFirstAdmin,
     signInWithUsername,
     registerWithUsername,
+    recoverUsername,
+    resetAccountWithRecovery,
+    resetLocalOfflineAuth,
     signOutUser,
   } = useAuth();
 
   const isOnline = useOnlineStatus();
   const [mode, setMode] = useState<AuthMode>('login');
+  const [recoverTab, setRecoverTab] = useState<RecoverTab>('reset');
+
   const [username, setUsername] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [recoveryCode, setRecoveryCode] = useState('');
+
+  // Forgot username state
+  const [lookupDisplayName, setLookupDisplayName] = useState('');
+  const [lookupSecret, setLookupSecret] = useState('');
+  const [foundUsername, setFoundUsername] = useState<string | null>(null);
+
+  // Account reset state
+  const [resetIdentifier, setResetIdentifier] = useState('');
+  const [resetCode, setResetCode] = useState('');
+  const [resetNewUsername, setResetNewUsername] = useState('');
+  const [resetNewPassword, setResetNewPassword] = useState('');
+  const [resetConfirmPassword, setResetConfirmPassword] = useState('');
+  const [recoverBusy, setRecoverBusy] = useState(false);
+  const [recoverSuccess, setRecoverSuccess] = useState<string | null>(null);
+
+  // Local device emergency reset
+  const [showLocalResetConfirm, setShowLocalResetConfirm] = useState(false);
+  const [localResetKeyword, setLocalResetKeyword] = useState('');
+
   const [localError, setLocalError] = useState<string | null>(null);
 
   const isPending = pendingStatusUser?.status === 'pending';
@@ -44,6 +74,8 @@ export function LoginPage() {
   const switchMode = (nextMode: AuthMode) => {
     setMode(nextMode);
     setLocalError(null);
+    setRecoverSuccess(null);
+    setFoundUsername(null);
     clearAuthMessages();
   };
 
@@ -65,7 +97,16 @@ export function LoginPage() {
         setLocalError('Konfirmasi kata sandi tidak cocok.');
         return;
       }
-      await setupFirstAdmin(username.trim(), displayName.trim() || username.trim(), password);
+      if (recoveryCode.trim() && recoveryCode.trim().length < 4) {
+        setLocalError('Kode pemulihan akun minimal 4 karakter jika diisi.');
+        return;
+      }
+      await setupFirstAdmin(
+        username.trim(),
+        displayName.trim() || username.trim(),
+        password,
+        recoveryCode.trim() || undefined
+      );
       return;
     }
 
@@ -91,12 +132,100 @@ export function LoginPage() {
         setLocalError('Konfirmasi kata sandi tidak cocok.');
         return;
       }
+      if (recoveryCode.trim() && recoveryCode.trim().length < 4) {
+        setLocalError('Kode pemulihan akun minimal 4 karakter jika diisi.');
+        return;
+      }
       await registerWithUsername(
         username.trim(),
         displayName.trim() || username.trim(),
-        password
+        password,
+        recoveryCode.trim() || undefined
       );
     }
+  };
+
+  const handleRecoverUsername = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLocalError(null);
+    setRecoverSuccess(null);
+    setFoundUsername(null);
+    clearAuthMessages();
+
+    if (!lookupDisplayName.trim() || !lookupSecret) {
+      setLocalError('Nama lengkap dan kata sandi (atau kode pemulihan) wajib diisi.');
+      return;
+    }
+
+    setRecoverBusy(true);
+    try {
+      const res = await recoverUsername(lookupDisplayName.trim(), lookupSecret);
+      setFoundUsername(res.username);
+      setRecoverSuccess(
+        `Nama pengguna untuk "${res.displayName}" ditemukan${res.fromOffline ? ' (data lokal)' : ''}.`
+      );
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : 'Gagal mencari nama pengguna.');
+    } finally {
+      setRecoverBusy(false);
+    }
+  };
+
+  const handleResetAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLocalError(null);
+    setRecoverSuccess(null);
+    clearAuthMessages();
+
+    if (!resetIdentifier.trim() || !resetCode.trim() || !resetNewPassword) {
+      setLocalError('Nama pengguna/nama lengkap, kode pemulihan, dan kata sandi baru wajib diisi.');
+      return;
+    }
+    if (resetNewPassword.length < 6) {
+      setLocalError('Kata sandi baru minimal 6 karakter.');
+      return;
+    }
+    if (resetNewPassword !== resetConfirmPassword) {
+      setLocalError('Konfirmasi kata sandi baru tidak cocok.');
+      return;
+    }
+    if (resetNewUsername.trim() && resetNewUsername.trim().length < 3) {
+      setLocalError('Nama pengguna baru minimal 3 karakter.');
+      return;
+    }
+
+    setRecoverBusy(true);
+    try {
+      const res = await resetAccountWithRecovery({
+        identifier: resetIdentifier.trim(),
+        recoveryCode: resetCode.trim(),
+        newUsername: resetNewUsername.trim() || undefined,
+        newPassword: resetNewPassword,
+      });
+      setUsername(res.username);
+      setPassword('');
+      setResetCode('');
+      setResetNewUsername('');
+      setResetNewPassword('');
+      setResetConfirmPassword('');
+      setRecoverSuccess(res.message);
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : 'Gagal mereset akun.');
+    } finally {
+      setRecoverBusy(false);
+    }
+  };
+
+  const handleLocalOfflineReset = async () => {
+    if (localResetKeyword.trim().toUpperCase() !== 'RESET') {
+      setLocalError('Ketik kata RESET dengan huruf besar untuk mengonfirmasi.');
+      return;
+    }
+    setLocalError(null);
+    await resetLocalOfflineAuth();
+    setShowLocalResetConfirm(false);
+    setLocalResetKeyword('');
+    setMode('login');
   };
 
   const visibleError = localError || authError;
@@ -204,7 +333,7 @@ export function LoginPage() {
                   <button
                     type="button"
                     onClick={() => switchMode('login')}
-                    className={`flex-1 rounded-md px-3 py-2 text-xs font-semibold transition-colors ${
+                    className={`flex-1 rounded-md px-2.5 py-2 text-xs font-semibold transition-colors ${
                       mode === 'login'
                         ? 'bg-white text-[#0F3D2E] shadow-sm'
                         : 'text-slate-600 hover:text-[#111C18]'
@@ -215,13 +344,24 @@ export function LoginPage() {
                   <button
                     type="button"
                     onClick={() => switchMode('register')}
-                    className={`flex-1 rounded-md px-3 py-2 text-xs font-semibold transition-colors ${
+                    className={`flex-1 rounded-md px-2.5 py-2 text-xs font-semibold transition-colors ${
                       mode === 'register'
                         ? 'bg-white text-[#0F3D2E] shadow-sm'
                         : 'text-slate-600 hover:text-[#111C18]'
                     }`}
                   >
                     Daftar Akun
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => switchMode('recover')}
+                    className={`flex-1 rounded-md px-2.5 py-2 text-xs font-semibold transition-colors ${
+                      mode === 'recover'
+                        ? 'bg-white text-[#0F3D2E] shadow-sm'
+                        : 'text-slate-600 hover:text-[#111C18]'
+                    }`}
+                  >
+                    Lupa / Reset
                   </button>
                 </div>
               )}
@@ -231,14 +371,18 @@ export function LoginPage() {
                   ? 'Buat Akun Administrator Pertama'
                   : mode === 'login'
                   ? 'Masuk ke Sistem'
-                  : 'Daftar Pengguna Baru'}
+                  : mode === 'register'
+                  ? 'Daftar Pengguna Baru'
+                  : 'Pemulihan & Reset Akun'}
               </h2>
               <p className="mt-1.5 text-sm leading-relaxed text-slate-600">
                 {needsSetup
                   ? 'Belum ada Administrator terdaftar. Tentukan nama pengguna dan kata sandi Administrator utama.'
                   : mode === 'login'
                   ? 'Masukkan nama pengguna dan kata sandi Anda (tanpa email).'
-                  : 'Buat akun baru menggunakan nama pengguna dan kata sandi.'}
+                  : mode === 'register'
+                  ? 'Buat akun baru menggunakan nama pengguna dan kata sandi.'
+                  : 'Cari nama pengguna yang terlupa atau atur ulang kata sandi menggunakan kode pemulihan.'}
               </p>
 
               {visibleError && (
@@ -251,100 +395,359 @@ export function LoginPage() {
                 </div>
               )}
 
-              {authNotice && (
+              {(authNotice || recoverSuccess) && (
                 <div className="mt-4 flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3.5 text-xs text-emerald-900">
                   <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-                  <span>{authNotice}</span>
+                  <span>{recoverSuccess || authNotice}</span>
                 </div>
               )}
 
-              <form onSubmit={handleSubmit} className="mt-6 space-y-4">
-                <div>
-                  <label className="block text-xs font-medium text-slate-700">
-                    Nama Pengguna (untuk masuk)
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    autoComplete="username"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    placeholder="Contoh: admin atau operator1"
-                    className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
-                  />
-                </div>
+              {!needsSetup && mode === 'recover' ? (
+                <div className="mt-5 space-y-5">
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRecoverTab('reset');
+                        setLocalError(null);
+                        setRecoverSuccess(null);
+                      }}
+                      className={`inline-flex items-center justify-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-semibold transition-colors ${
+                        recoverTab === 'reset'
+                          ? 'border-[#0F3D2E] bg-[#0F3D2E]/5 text-[#0F3D2E]'
+                          : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                      }`}
+                    >
+                      <KeyRound className="h-3.5 w-3.5" />
+                      Reset Akun / Sandi
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRecoverTab('username');
+                        setLocalError(null);
+                        setRecoverSuccess(null);
+                      }}
+                      className={`inline-flex items-center justify-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-semibold transition-colors ${
+                        recoverTab === 'username'
+                          ? 'border-[#0F3D2E] bg-[#0F3D2E]/5 text-[#0F3D2E]'
+                          : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                      }`}
+                    >
+                      <UserSearch className="h-3.5 w-3.5" />
+                      Lupa Nama Pengguna
+                    </button>
+                  </div>
 
-                {(needsSetup || mode === 'register') && (
+                  {recoverTab === 'username' ? (
+                    <form onSubmit={handleRecoverUsername} className="space-y-4">
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700">
+                          Nama Lengkap / Tampilan
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={lookupDisplayName}
+                          onChange={(e) => setLookupDisplayName(e.target.value)}
+                          placeholder="Sesuai nama lengkap yang didaftarkan"
+                          className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700">
+                          Kata Sandi atau Kode Pemulihan Akun
+                        </label>
+                        <input
+                          type="password"
+                          required
+                          value={lookupSecret}
+                          onChange={(e) => setLookupSecret(e.target.value)}
+                          placeholder="Masukkan kata sandi atau kode pemulihan"
+                          className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                        />
+                      </div>
+
+                      {foundUsername && (
+                        <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3.5">
+                          <p className="text-xs text-emerald-800">Nama Pengguna Anda:</p>
+                          <p className="mt-1 font-mono text-base font-bold text-[#0F3D2E]">
+                            {foundUsername}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setUsername(foundUsername);
+                              switchMode('login');
+                            }}
+                            className="mt-2.5 inline-flex items-center gap-1.5 rounded-lg bg-[#0F3D2E] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#144D3A]"
+                          >
+                            <LogIn className="h-3.5 w-3.5" />
+                            Masuk dengan Nama Ini
+                          </button>
+                        </div>
+                      )}
+
+                      <button
+                        type="submit"
+                        disabled={recoverBusy}
+                        className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[#0F3D2E] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#144D3A] disabled:opacity-60"
+                      >
+                        <UserSearch className="h-4 w-4" />
+                        {recoverBusy ? 'Mencari...' : 'Cari Nama Pengguna'}
+                      </button>
+                    </form>
+                  ) : (
+                    <form onSubmit={handleResetAccount} className="space-y-3.5">
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700">
+                          Nama Pengguna atau Nama Lengkap
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={resetIdentifier}
+                          onChange={(e) => setResetIdentifier(e.target.value)}
+                          placeholder="Contoh: admin atau Ahmad Fauzi"
+                          className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700">
+                          Kode Pemulihan Akun{hasEnvAdminPasscode ? ' (atau Kode Akses Server)' : ''}
+                        </label>
+                        <input
+                          type="password"
+                          required
+                          value={resetCode}
+                          onChange={(e) => setResetCode(e.target.value)}
+                          placeholder="Kode pemulihan yang dibuat saat pendaftaran/pengaturan"
+                          className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700">
+                          Nama Pengguna Baru (Opsional)
+                        </label>
+                        <input
+                          type="text"
+                          value={resetNewUsername}
+                          onChange={(e) => setResetNewUsername(e.target.value)}
+                          placeholder="Kosongkan jika tidak mengubah nama pengguna"
+                          className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700">
+                            Kata Sandi Baru
+                          </label>
+                          <input
+                            type="password"
+                            required
+                            minLength={6}
+                            value={resetNewPassword}
+                            onChange={(e) => setResetNewPassword(e.target.value)}
+                            placeholder="Minimal 6 karakter"
+                            className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700">
+                            Ulangi Sandi Baru
+                          </label>
+                          <input
+                            type="password"
+                            required
+                            minLength={6}
+                            value={resetConfirmPassword}
+                            onChange={(e) => setResetConfirmPassword(e.target.value)}
+                            placeholder="Konfirmasi sandi"
+                            className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                          />
+                        </div>
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={recoverBusy}
+                        className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[#0F3D2E] px-5 py-2.5 text-sm font-semibold text-white hover:bg-[#144D3A] disabled:opacity-60"
+                      >
+                        <RotateCcw className="h-4 w-4" />
+                        {recoverBusy ? 'Memproses...' : 'Reset Nama / Sandi Akun'}
+                      </button>
+
+                      {recoverSuccess && (
+                        <button
+                          type="button"
+                          onClick={() => switchMode('login')}
+                          className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-[#0F3D2E] hover:bg-slate-50"
+                        >
+                          <LogIn className="h-3.5 w-3.5" />
+                          Lanjut ke Halaman Masuk
+                        </button>
+                      )}
+                    </form>
+                  )}
+
+                  {/* Local Device Emergency Reset */}
+                  <div className="border-t border-slate-100 pt-4">
+                    {!showLocalResetConfirm ? (
+                      <button
+                        type="button"
+                        onClick={() => setShowLocalResetConfirm(true)}
+                        className="text-xs font-medium text-slate-500 underline-offset-2 hover:text-red-700 hover:underline"
+                      >
+                        Lupa total akun lokal perangkat ini? Reset penyimpanan akun lokal
+                      </button>
+                    ) : (
+                      <div className="rounded-lg border border-amber-200 bg-amber-50 p-3.5 space-y-2.5">
+                        <p className="text-xs font-semibold text-amber-950">
+                          Reset Data Akun Lokal Peramban
+                        </p>
+                        <p className="text-[11px] leading-relaxed text-amber-900">
+                          Tindakan ini menghapus cache akun pada peramban ini saja (data lembaga dan server tidak terhapus). Ketik <span className="font-mono font-bold">RESET</span> untuk melanjutkan.
+                        </p>
+                        <input
+                          type="text"
+                          value={localResetKeyword}
+                          onChange={(e) => setLocalResetKeyword(e.target.value)}
+                          placeholder="Ketik RESET"
+                          className="w-full rounded-md border border-amber-300 bg-white px-3 py-1.5 font-mono text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                        />
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={handleLocalOfflineReset}
+                            className="rounded-md bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700"
+                          >
+                            Konfirmasi Reset Lokal
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowLocalResetConfirm(false);
+                              setLocalResetKeyword('');
+                            }}
+                            className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                          >
+                            Batal
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <form onSubmit={handleSubmit} className="mt-6 space-y-4">
                   <div>
                     <label className="block text-xs font-medium text-slate-700">
-                      Nama Lengkap / Tampilan
+                      Nama Pengguna (untuk masuk)
                     </label>
                     <input
                       type="text"
-                      value={displayName}
-                      onChange={(e) => setDisplayName(e.target.value)}
-                      placeholder="Contoh: Ahmad Fauzi"
+                      required
+                      autoComplete="username"
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value)}
+                      placeholder="Contoh: admin atau operator1"
                       className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
                     />
                   </div>
-                )}
 
-                <div>
-                  <label className="block text-xs font-medium text-slate-700">
-                    Kata Sandi
-                  </label>
-                  <input
-                    type="password"
-                    required
-                    minLength={6}
-                    autoComplete={needsSetup || mode === 'register' ? 'new-password' : 'current-password'}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Minimal 6 karakter"
-                    className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
-                  />
-                </div>
+                  {(needsSetup || mode === 'register') && (
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700">
+                        Nama Lengkap / Tampilan
+                      </label>
+                      <input
+                        type="text"
+                        value={displayName}
+                        onChange={(e) => setDisplayName(e.target.value)}
+                        placeholder="Contoh: Ahmad Fauzi"
+                        className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                      />
+                    </div>
+                  )}
 
-                {(needsSetup || mode === 'register') && (
                   <div>
                     <label className="block text-xs font-medium text-slate-700">
-                      Konfirmasi Kata Sandi
+                      Kata Sandi
                     </label>
                     <input
                       type="password"
                       required
                       minLength={6}
-                      autoComplete="new-password"
-                      value={confirmPassword}
-                      onChange={(e) => setConfirmPassword(e.target.value)}
-                      placeholder="Ulangi kata sandi"
+                      autoComplete={needsSetup || mode === 'register' ? 'new-password' : 'current-password'}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="Minimal 6 karakter"
                       className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
                     />
                   </div>
-                )}
 
-                <button
-                  type="submit"
-                  disabled={signingIn}
-                  className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[#0F3D2E] px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-[#144D3A] disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {needsSetup || mode === 'register' ? (
+                  {(needsSetup || mode === 'register') && (
                     <>
-                      <UserPlus className="h-4 w-4" />
-                      {signingIn
-                        ? 'Memproses...'
-                        : needsSetup
-                        ? 'Simpan & Masuk sebagai Administrator'
-                        : 'Daftarkan Akun'}
-                    </>
-                  ) : (
-                    <>
-                      <LogIn className="h-4 w-4" />
-                      {signingIn ? 'Memeriksa...' : 'Masuk'}
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700">
+                          Konfirmasi Kata Sandi
+                        </label>
+                        <input
+                          type="password"
+                          required
+                          minLength={6}
+                          autoComplete="new-password"
+                          value={confirmPassword}
+                          onChange={(e) => setConfirmPassword(e.target.value)}
+                          placeholder="Ulangi kata sandi"
+                          className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700">
+                          Kode Pemulihan Akun (Opsional · min. 4 karakter)
+                        </label>
+                        <input
+                          type="text"
+                          minLength={4}
+                          maxLength={64}
+                          value={recoveryCode}
+                          onChange={(e) => setRecoveryCode(e.target.value)}
+                          placeholder="Untuk reset mandiri jika lupa nama/sandi"
+                          className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                        />
+                      </div>
                     </>
                   )}
-                </button>
-              </form>
+
+                  <button
+                    type="submit"
+                    disabled={signingIn}
+                    className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[#0F3D2E] px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-[#144D3A] disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {needsSetup || mode === 'register' ? (
+                      <>
+                        <UserPlus className="h-4 w-4" />
+                        {signingIn
+                          ? 'Memproses...'
+                          : needsSetup
+                          ? 'Simpan & Masuk sebagai Administrator'
+                          : 'Daftarkan Akun'}
+                      </>
+                    ) : (
+                      <>
+                        <LogIn className="h-4 w-4" />
+                        {signingIn ? 'Memeriksa...' : 'Masuk'}
+                      </>
+                    )}
+                  </button>
+                </form>
+              )}
 
               <div className="mt-6 border-t border-slate-100 pt-5">
                 <div className="flex items-start gap-2.5 text-xs leading-relaxed text-slate-500">
@@ -352,6 +755,8 @@ export function LoginPage() {
                   <p>
                     {needsSetup
                       ? 'Pengaturan awal ini hanya muncul satu kali sebelum akun Administrator pertama dibuat.'
+                      : mode === 'recover'
+                      ? 'Jika kode pemulihan belum diatur, Administrator tetap dapat mereset nama pengguna dan kata sandi melalui menu Manajemen Pengguna.'
                       : 'Pengguna baru yang mendaftar memperoleh peran dasar Operator dengan status menunggu aktivasi Administrator.'}
                   </p>
                 </div>

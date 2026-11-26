@@ -43,6 +43,7 @@ export function SettingsPage() {
   const [position, setPosition] = useState('');
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
+  const [recoveryCode, setRecoveryCode] = useState('');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -63,6 +64,12 @@ export function SettingsPage() {
       return;
     }
 
+    const cleanRecovery = recoveryCode.trim();
+    if (cleanRecovery && cleanRecovery.length < 4) {
+      showToast('Kode pemulihan akun minimal 4 karakter.', 'error');
+      return;
+    }
+
     setSaving(true);
     try {
       const { queuedOffline } = await updateOwnProfile({
@@ -71,9 +78,11 @@ export function SettingsPage() {
         position: sanitizeString(position, BLUEPRINT_LIMITS.user.positionMax),
         currentPassword: currentPassword || undefined,
         newPassword: newPassword || undefined,
+        recoveryCode: cleanRecovery || undefined,
       });
       setCurrentPassword('');
       setNewPassword('');
+      setRecoveryCode('');
       showToast(
         queuedOffline
           ? 'Pengaturan disimpan secara lokal (offline) dan akan tersinkron otomatis.'
@@ -96,7 +105,7 @@ export function SettingsPage() {
               Pengaturan Akun & Akses Offline
             </h2>
             <p className="mt-1 text-sm text-slate-600">
-              Perbarui nama tampilan, jabatan, telepon, serta kata sandi akun Anda tanpa menggunakan email.
+              Perbarui nama tampilan, jabatan, telepon, kata sandi, serta kode pemulihan akun Anda tanpa menggunakan email.
             </p>
           </div>
           <PWAInstallButton />
@@ -185,6 +194,34 @@ export function SettingsPage() {
                 className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
               />
             </div>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between gap-2">
+              <label className="block text-xs font-medium text-slate-700">
+                Kode Pemulihan Akun (Opsional · min. 4 karakter)
+              </label>
+              <span
+                className={`text-[11px] font-medium ${
+                  appUser?.hasRecoveryCode ? 'text-[#16A34A]' : 'text-amber-600'
+                }`}
+              >
+                {appUser?.hasRecoveryCode ? 'Kode sudah diatur' : 'Belum diatur'}
+              </span>
+            </div>
+            <input
+              type="text"
+              minLength={4}
+              maxLength={64}
+              value={recoveryCode}
+              onChange={(e) => setRecoveryCode(e.target.value)}
+              placeholder={
+                appUser?.hasRecoveryCode
+                  ? 'Isi hanya jika ingin mengganti kode pemulihan'
+                  : 'Tetapkan kode pemulihan untuk reset jika lupa nama/sandi'
+              }
+              className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+            />
           </div>
 
           <div className="pt-2">

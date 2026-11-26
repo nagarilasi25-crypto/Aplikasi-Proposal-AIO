@@ -7,6 +7,8 @@ interface OfflineAuthRecord {
   usernameKey: string;
   saltHex: string;
   hashHex: string;
+  recoverySaltHex?: string;
+  recoveryHashHex?: string;
   user: AppUser;
   updatedAt: string;
 }
@@ -75,23 +77,65 @@ async function derivePbkdf2(password: string, salt: Uint8Array): Promise<string>
   return toHex(new Uint8Array(derived));
 }
 
+async function verifyPbkdf2(
+  secret: string,
+  saltHex?: string,
+  hashHex?: string
+): Promise<boolean> {
+  if (!saltHex || !hashHex || typeof crypto === 'undefined' || !crypto.subtle) {
+    return false;
+  }
+  const candidateHash = await derivePbkdf2(secret, fromHex(saltHex));
+  if (candidateHash.length !== hashHex.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < candidateHash.length; i++) {
+    diff |= candidateHash.charCodeAt(i) ^ hashHex.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
 export async function cacheOfflineAuthCredential(
   username: string,
   password: string,
-  user: AppUser
+  user: AppUser,
+  recoveryCode?: string
 ): Promise<void> {
   if (typeof indexedDB === 'undefined' || !crypto?.subtle) return;
+  const usernameKey = username.trim().toLowerCase();
+  const db = await openOfflineDb();
+
+  const existing = await new Promise<OfflineAuthRecord | undefined>((resolve, reject) => {
+    const tx = db.transaction('offlineAuth', 'readonly');
+    const req = tx.objectStore('offlineAuth').get(usernameKey);
+    req.onsuccess = () => resolve(req.result as OfflineAuthRecord | undefined);
+    req.onerror = () => reject(req.error);
+  });
+
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const hashHex = await derivePbkdf2(password, salt);
+
+  let recoverySaltHex = existing?.recoverySaltHex;
+  let recoveryHashHex = existing?.recoveryHashHex;
+  if (recoveryCode && recoveryCode.trim().length >= 4) {
+    const recSalt = crypto.getRandomValues(new Uint8Array(16));
+    recoverySaltHex = toHex(recSalt);
+    recoveryHashHex = await derivePbkdf2(recoveryCode.trim(), recSalt);
+  }
+
   const record: OfflineAuthRecord = {
-    usernameKey: username.trim().toLowerCase(),
+    usernameKey,
     saltHex: toHex(salt),
     hashHex,
-    user,
+    ...(recoverySaltHex && recoveryHashHex ? { recoverySaltHex, recoveryHashHex } : {}),
+    user: {
+      ...user,
+      hasRecoveryCode: Boolean(user.hasRecoveryCode || recoveryHashHex),
+    },
     updatedAt: new Date().toISOString(),
   };
 
-  const db = await openOfflineDb();
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction('offlineAuth', 'readwrite');
     tx.objectStore('offlineAuth').put(record);
@@ -179,7 +223,8 @@ export async function getAllOfflineUsers(): Promise<AppUser[]> {
 export async function updateOfflineAuthUserMetadata(
   uid: string,
   updates: Partial<AppUser>,
-  newPassword?: string
+  newPassword?: string,
+  newRecoveryCode?: string
 ): Promise<AppUser | null> {
   if (typeof indexedDB === 'undefined') return null;
   const db = await openOfflineDb();
@@ -193,6 +238,19 @@ export async function updateOfflineAuthUserMetadata(
   const target = rows.find((r) => r.user.uid === uid);
   if (!target) return null;
 
+  const nextUsername =
+    typeof updates.username === 'string' && updates.username.trim()
+      ? updates.username.trim()
+      : target.user.username || target.usernameKey;
+  const nextUsernameKey = nextUsername.toLowerCase();
+
+  if (
+    nextUsernameKey !== target.usernameKey &&
+    rows.some((r) => r.user.uid !== uid && r.usernameKey === nextUsernameKey)
+  ) {
+    throw new Error('Nama pengguna tersebut sudah digunakan akun lain.');
+  }
+
   let saltHex = target.saltHex;
   let hashHex = target.hashHex;
   if (newPassword && newPassword.length >= 6 && crypto?.subtle) {
@@ -201,28 +259,146 @@ export async function updateOfflineAuthUserMetadata(
     hashHex = await derivePbkdf2(newPassword, salt);
   }
 
+  let recoverySaltHex = target.recoverySaltHex;
+  let recoveryHashHex = target.recoveryHashHex;
+  if (newRecoveryCode && newRecoveryCode.trim().length >= 4 && crypto?.subtle) {
+    const recSalt = crypto.getRandomValues(new Uint8Array(16));
+    recoverySaltHex = toHex(recSalt);
+    recoveryHashHex = await derivePbkdf2(newRecoveryCode.trim(), recSalt);
+  }
+
   const nextUser: AppUser = {
     ...target.user,
     ...updates,
+    username: nextUsername,
+    hasRecoveryCode: Boolean(updates.hasRecoveryCode || recoveryHashHex),
     updatedAt: new Date().toISOString(),
   };
 
   const nextRecord: OfflineAuthRecord = {
     ...target,
+    usernameKey: nextUsernameKey,
     saltHex,
     hashHex,
+    ...(recoverySaltHex && recoveryHashHex ? { recoverySaltHex, recoveryHashHex } : {}),
     user: nextUser,
     updatedAt: new Date().toISOString(),
   };
 
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction('offlineAuth', 'readwrite');
-    tx.objectStore('offlineAuth').put(nextRecord);
+    const store = tx.objectStore('offlineAuth');
+    if (nextUsernameKey !== target.usernameKey) {
+      store.delete(target.usernameKey);
+    }
+    store.put(nextRecord);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
 
   return nextUser;
+}
+
+export async function recoverOfflineUsername(
+  displayName: string,
+  secret: string
+): Promise<{ username: string; displayName: string } | null> {
+  if (typeof indexedDB === 'undefined' || !crypto?.subtle) return null;
+  const db = await openOfflineDb();
+  const rows = await new Promise<OfflineAuthRecord[]>((resolve, reject) => {
+    const tx = db.transaction('offlineAuth', 'readonly');
+    const req = tx.objectStore('offlineAuth').getAll();
+    req.onsuccess = () => resolve((req.result as OfflineAuthRecord[]) || []);
+    req.onerror = () => reject(req.error);
+  });
+
+  const cleanName = displayName.trim().toLowerCase();
+  const candidates = rows.filter(
+    (r) => (r.user.displayName || '').trim().toLowerCase() === cleanName
+  );
+
+  for (const cand of candidates) {
+    const passMatch = await verifyPbkdf2(secret, cand.saltHex, cand.hashHex);
+    const recMatch = await verifyPbkdf2(
+      secret.trim(),
+      cand.recoverySaltHex,
+      cand.recoveryHashHex
+    );
+    if (passMatch || recMatch) {
+      return {
+        username: cand.user.username || cand.usernameKey,
+        displayName: cand.user.displayName,
+      };
+    }
+  }
+  return null;
+}
+
+export async function resetOfflineAccount(
+  identifier: string,
+  recoveryCode: string,
+  newUsername: string,
+  newPassword: string
+): Promise<{ username: string }> {
+  if (typeof indexedDB === 'undefined' || !crypto?.subtle) {
+    throw new Error('Penyimpanan lokal tidak tersedia pada peramban ini.');
+  }
+  const db = await openOfflineDb();
+  const rows = await new Promise<OfflineAuthRecord[]>((resolve, reject) => {
+    const tx = db.transaction('offlineAuth', 'readonly');
+    const req = tx.objectStore('offlineAuth').getAll();
+    req.onsuccess = () => resolve((req.result as OfflineAuthRecord[]) || []);
+    req.onerror = () => reject(req.error);
+  });
+
+  const lowered = identifier.trim().toLowerCase();
+  const target =
+    rows.find((r) => (r.user.username || r.usernameKey).toLowerCase() === lowered) ||
+    (() => {
+      const byDisplay = rows.filter(
+        (r) => (r.user.displayName || '').trim().toLowerCase() === lowered
+      );
+      return byDisplay.length === 1 ? byDisplay[0] : undefined;
+    })();
+
+  if (!target) {
+    throw new Error('Akun tidak ditemukan pada penyimpanan lokal perangkat ini.');
+  }
+
+  const validRecovery = await verifyPbkdf2(
+    recoveryCode.trim(),
+    target.recoverySaltHex,
+    target.recoveryHashHex
+  );
+  if (!validRecovery) {
+    throw new Error(
+      'Kode pemulihan tidak sesuai atau belum diatur pada akun ini.'
+    );
+  }
+
+  const updated = await updateOfflineAuthUserMetadata(
+    target.user.uid,
+    {
+      username: newUsername.trim() || target.user.username || target.usernameKey,
+    },
+    newPassword
+  );
+  if (!updated) {
+    throw new Error('Gagal memperbarui akun.');
+  }
+  return { username: updated.username || target.usernameKey };
+}
+
+export async function clearAllOfflineAuthAccounts(): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const db = await openOfflineDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(['offlineAuth', 'kvStore'], 'readwrite');
+    tx.objectStore('offlineAuth').clear();
+    tx.objectStore('kvStore').delete('users');
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
 }
 
 export async function deleteOfflineAuthUser(uid: string): Promise<void> {
@@ -286,6 +462,7 @@ export async function enqueueOfflineMutation(
 ): Promise<void> {
   if (typeof indexedDB === 'undefined') return;
   const db = await openOfflineDb();
+  const existingQueue = await getOfflineMutationQueue();
   const entry: OfflineSyncMutation = {
     ...mutation,
     id: `mut_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -293,7 +470,13 @@ export async function enqueueOfflineMutation(
   };
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction('syncQueue', 'readwrite');
-    tx.objectStore('syncQueue').put(entry);
+    const store = tx.objectStore('syncQueue');
+    for (const old of existingQueue) {
+      if (old.endpoint === mutation.endpoint && old.method === mutation.method) {
+        store.delete(old.id);
+      }
+    }
+    store.put(entry);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

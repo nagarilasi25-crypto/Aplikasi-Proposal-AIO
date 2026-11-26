@@ -9,13 +9,17 @@ import {
 import {
   cacheDashboardSnapshot,
   cacheOfflineAuthCredential,
+  clearAllOfflineAuthAccounts,
   enqueueOfflineMutation,
   getOfflineKV,
   getOfflineMutationQueue,
   hasAnyOfflineAccount,
   hasOfflineUsername,
+  recoverOfflineUsername,
   removeOfflineMutation,
+  resetOfflineAccount,
   setOfflineKV,
+  updateOfflineAuthUserMetadata,
   verifyOfflineAuthCredentialDetailed,
 } from '../lib/offlineDb';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
@@ -25,6 +29,13 @@ interface ParsedApiResponse<T> {
   status: number;
   isJson: boolean;
   data: T | null;
+}
+
+class RecoverableTransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RecoverableTransportError';
+  }
 }
 
 function extractErrorMessage(payload: unknown, fallback: string): string {
@@ -93,9 +104,30 @@ interface AuthContextValue {
   authError: string | null;
   authNotice: string | null;
   clearAuthMessages: () => void;
-  setupFirstAdmin: (username: string, displayName: string, password: string) => Promise<void>;
+  setupFirstAdmin: (
+    username: string,
+    displayName: string,
+    password: string,
+    recoveryCode?: string
+  ) => Promise<void>;
   signInWithUsername: (username: string, password: string) => Promise<void>;
-  registerWithUsername: (username: string, displayName: string, password: string) => Promise<void>;
+  registerWithUsername: (
+    username: string,
+    displayName: string,
+    password: string,
+    recoveryCode?: string
+  ) => Promise<void>;
+  recoverUsername: (
+    displayName: string,
+    secret: string
+  ) => Promise<{ username: string; displayName: string; fromOffline: boolean }>;
+  resetAccountWithRecovery: (payload: {
+    identifier: string;
+    recoveryCode: string;
+    newUsername?: string;
+    newPassword: string;
+  }) => Promise<{ username: string; message: string; fromOffline: boolean }>;
+  resetLocalOfflineAuth: () => Promise<void>;
   signOutUser: () => void;
   apiRequest: <T = unknown>(
     path: string,
@@ -104,6 +136,11 @@ interface AuthContextValue {
       body?: Record<string, unknown>;
     }
   ) => Promise<T>;
+  uploadInstitutionImage: (
+    field: 'logoUrl' | 'photoUrl',
+    dataUrl: string,
+    baseProfile?: InstitutionProfile
+  ) => Promise<{ url: string; queuedOffline: boolean }>;
   saveInstitution: (payload: InstitutionProfile) => Promise<{ queuedOffline: boolean }>;
   updateOwnProfile: (payload: {
     displayName: string;
@@ -111,6 +148,7 @@ interface AuthContextValue {
     position: string;
     currentPassword?: string;
     newPassword?: string;
+    recoveryCode?: string;
   }) => Promise<{ queuedOffline: boolean }>;
   refreshDashboardData: () => Promise<void>;
 }
@@ -202,8 +240,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
 
       const parsed = await parseJsonResponse<T & { error?: unknown }>(res);
-      if (!parsed.isJson) {
-        throw new Error('Layanan server tidak merespons dengan benar. Coba beberapa saat lagi.');
+      if (!parsed.isJson || res.status === 404 || res.status >= 500) {
+        throw new RecoverableTransportError(
+          extractErrorMessage(
+            parsed.data,
+            'Layanan server tidak merespons dengan benar. Coba beberapa saat lagi.'
+          )
+        );
       }
       if (!parsed.ok) {
         throw new Error(extractErrorMessage(parsed.data, 'Permintaan gagal diproses.'));
@@ -222,11 +265,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           proposals: ProposalRecord[];
           categories: ProposalCategory[];
         }>('/api/dashboard-data');
-        setInstitution(data.institution || EMPTY_INSTITUTION);
+
+        // Preserve any locally queued institution draft until queue flush finishes
+        const pendingQueue = await getOfflineMutationQueue();
+        const hasPendingInst = pendingQueue.some((m) => m.endpoint === '/api/institution');
+        const cachedInst = hasPendingInst
+          ? await getOfflineKV<InstitutionProfile>('institution')
+          : null;
+        const effectiveInst = cachedInst || data.institution || EMPTY_INSTITUTION;
+
+        setInstitution(effectiveInst);
         setProposals(data.proposals || []);
         setCategories(data.categories || []);
         await cacheDashboardSnapshot({
-          institution: data.institution || EMPTY_INSTITUTION,
+          institution: effectiveInst,
           proposals: data.proposals || [],
           categories: data.categories || [],
         });
@@ -254,7 +306,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [apiRequest, isOnline, sessionToken]);
 
-  // Flush queued offline mutations when internet & session token are available
+  // Flush queued offline mutations automatically when internet & session token are available
   useEffect(() => {
     if (!isOnline || !sessionToken || !appUser) return;
 
@@ -262,6 +314,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const flushQueue = async () => {
       const queue = await getOfflineMutationQueue();
       if (queue.length === 0) return;
+
+      let syncedAny = false;
       for (const item of queue) {
         if (cancelled) break;
         try {
@@ -270,12 +324,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             body: item.body,
           });
           await removeOfflineMutation(item.id);
-        } catch {
+          syncedAny = true;
+        } catch (err) {
+          // Stop on transport outage; drop permanent 4xx rejection only if auth not broken
+          if (err instanceof TypeError || err instanceof RecoverableTransportError) {
+            break;
+          }
           break;
         }
       }
       await refreshQueueCount();
-      await refreshDashboardData();
+      if (syncedAny && !cancelled) {
+        await refreshDashboardData();
+      }
     };
 
     flushQueue();
@@ -289,17 +350,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     password: string,
     token: string,
     user: AppUser,
-    inst: InstitutionProfile
+    inst: InstitutionProfile,
+    recoveryCode?: string
   ) => {
+    const pendingQueue = await getOfflineMutationQueue();
+    const hasPendingInst = pendingQueue.some((m) => m.endpoint === '/api/institution');
+    const cachedInst = hasPendingInst
+      ? await getOfflineKV<InstitutionProfile>('institution')
+      : null;
+    const effectiveInst = cachedInst || inst || EMPTY_INSTITUTION;
+
     setSessionToken(token);
     setAppUser(user);
-    setInstitution(inst || EMPTY_INSTITUTION);
+    setInstitution(effectiveInst);
     setPendingStatusUser(null);
     setIsOfflineSession(false);
     setNeedsSetup(false);
 
-    await cacheOfflineAuthCredential(username, password, user);
-    await setOfflineKV('institution', inst || EMPTY_INSTITUTION);
+    await cacheOfflineAuthCredential(username, password, user, recoveryCode);
+    await setOfflineKV('institution', effectiveInst);
     await refreshQueueCount();
   };
 
@@ -312,10 +381,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await refreshDashboardData();
   };
 
-  const setupFirstAdmin = async (username: string, displayName: string, password: string) => {
+  const setupFirstAdmin = async (
+    username: string,
+    displayName: string,
+    password: string,
+    recoveryCode?: string
+  ) => {
     setSigningIn(true);
     setAuthError(null);
     setAuthNotice(null);
+    const cleanRecovery = recoveryCode?.trim() || undefined;
     try {
       if (navigator.onLine) {
         try {
@@ -325,7 +400,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               'Content-Type': 'application/json',
               Accept: 'application/json',
             },
-            body: JSON.stringify({ username, displayName, password }),
+            body: JSON.stringify({
+              username,
+              displayName,
+              password,
+              recoveryCode: cleanRecovery,
+            }),
           });
           const parsed = await parseJsonResponse<{
             token?: string;
@@ -348,7 +428,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               password,
               parsed.data.token,
               parsed.data.user,
-              parsed.data.institution || EMPTY_INSTITUTION
+              parsed.data.institution || EMPTY_INSTITUTION,
+              cleanRecovery
             );
             return;
           }
@@ -378,12 +459,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         position: 'Administrator Sistem',
         role: 'Administrator',
         status: 'active',
+        hasRecoveryCode: Boolean(cleanRecovery && cleanRecovery.length >= 4),
         createdAt: now,
         updatedAt: now,
         createdBy: localUid,
         updatedBy: localUid,
       };
-      await cacheOfflineAuthCredential(username, password, localAdmin);
+      await cacheOfflineAuthCredential(username, password, localAdmin, cleanRecovery);
       await setOfflineKV('institution', EMPTY_INSTITUTION);
       await applyLocalOfflineSession(localAdmin);
     } catch (err) {
@@ -453,7 +535,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           return;
         }
 
-        // Proxy/CDN returned 404/5xx or non-JSON (e.g. static preview or cold-start)
         serverUnavailable = true;
       }
     } catch (err) {
@@ -468,7 +549,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       serverUnavailable = true;
     }
 
-    // Offline or server-unavailable fallback: verify locally against PBKDF2-SHA256 cache in IndexedDB
     try {
       if (serverUnavailable) {
         const localCheck = await verifyOfflineAuthCredentialDetailed(username, password);
@@ -495,10 +575,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const registerWithUsername = async (username: string, displayName: string, password: string) => {
+  const registerWithUsername = async (
+    username: string,
+    displayName: string,
+    password: string,
+    recoveryCode?: string
+  ) => {
     setSigningIn(true);
     setAuthError(null);
     setAuthNotice(null);
+    const cleanRecovery = recoveryCode?.trim() || undefined;
     try {
       if (!navigator.onLine) {
         throw new Error('Pendaftaran akun baru memerlukan koneksi internet.');
@@ -509,7 +595,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
-        body: JSON.stringify({ username, displayName, password }),
+        body: JSON.stringify({
+          username,
+          displayName,
+          password,
+          recoveryCode: cleanRecovery,
+        }),
       });
       const parsed = await parseJsonResponse<{
         message?: string;
@@ -531,7 +622,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // Non-JSON / 404 / 5xx proxy response (e.g., static preview / server endpoint unavailable)
       const hasLocal = await hasAnyOfflineAccount();
       if (!hasLocal) {
         throw new Error(
@@ -553,12 +643,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         position: '',
         role: 'Operator',
         status: 'pending',
+        hasRecoveryCode: Boolean(cleanRecovery && cleanRecovery.length >= 4),
         createdAt: now,
         updatedAt: now,
         createdBy: localUid,
         updatedBy: localUid,
       };
-      await cacheOfflineAuthCredential(username, password, localPendingUser);
+      await cacheOfflineAuthCredential(username, password, localPendingUser, cleanRecovery);
       setAuthNotice(
         'Pendaftaran dicatat pada perangkat ini dengan status Menunggu Aktivasi oleh Administrator.'
       );
@@ -573,6 +664,189 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setSigningIn(false);
     }
+  };
+
+  const recoverUsername = async (
+    displayName: string,
+    secret: string
+  ): Promise<{ username: string; displayName: string; fromOffline: boolean }> => {
+    setAuthError(null);
+    let serverUnavailable = !navigator.onLine;
+
+    if (navigator.onLine) {
+      try {
+        const res = await fetch('/api/auth/recover-username', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({ displayName, secret }),
+        });
+        const parsed = await parseJsonResponse<{
+          username?: string;
+          displayName?: string;
+          error?: unknown;
+        }>(res);
+        const isEdgeOrProxyUnavailable =
+          !parsed.isJson || res.status === 404 || res.status >= 500;
+
+        if (!isEdgeOrProxyUnavailable) {
+          if (!parsed.ok || !parsed.data?.username) {
+            throw new Error(
+              extractErrorMessage(
+                parsed.data,
+                'Data nama lengkap atau kata sandi/kode pemulihan tidak cocok.'
+              )
+            );
+          }
+          return {
+            username: parsed.data.username,
+            displayName: parsed.data.displayName || displayName,
+            fromOffline: false,
+          };
+        }
+        serverUnavailable = true;
+      } catch (err) {
+        if (!(err instanceof TypeError)) {
+          throw err;
+        }
+        serverUnavailable = true;
+      }
+    }
+
+    if (serverUnavailable) {
+      const localMatch = await recoverOfflineUsername(displayName, secret);
+      if (localMatch) {
+        return { ...localMatch, fromOffline: true };
+      }
+    }
+
+    throw new Error('Data nama lengkap atau kata sandi/kode pemulihan tidak cocok.');
+  };
+
+  const resetAccountWithRecovery = async (payload: {
+    identifier: string;
+    recoveryCode: string;
+    newUsername?: string;
+    newPassword: string;
+  }): Promise<{ username: string; message: string; fromOffline: boolean }> => {
+    setAuthError(null);
+    let serverUnavailable = !navigator.onLine;
+
+    if (navigator.onLine) {
+      try {
+        const res = await fetch('/api/auth/reset-account', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+        const parsed = await parseJsonResponse<{
+          username?: string;
+          message?: string;
+          error?: unknown;
+        }>(res);
+        const isEdgeOrProxyUnavailable =
+          !parsed.isJson || res.status === 404 || res.status >= 500;
+
+        if (!isEdgeOrProxyUnavailable) {
+          if (!parsed.ok || !parsed.data?.username) {
+            throw new Error(
+              extractErrorMessage(parsed.data, 'Gagal mereset akun. Periksa kode pemulihan Anda.')
+            );
+          }
+          return {
+            username: parsed.data.username,
+            message:
+              parsed.data.message ||
+              `Akun ${parsed.data.username} berhasil direset. Silakan masuk dengan kredensial baru.`,
+            fromOffline: false,
+          };
+        }
+        serverUnavailable = true;
+      } catch (err) {
+        if (!(err instanceof TypeError)) {
+          throw err;
+        }
+        serverUnavailable = true;
+      }
+    }
+
+    if (serverUnavailable) {
+      const localResult = await resetOfflineAccount(
+        payload.identifier,
+        payload.recoveryCode,
+        payload.newUsername || '',
+        payload.newPassword
+      );
+      return {
+        username: localResult.username,
+        message: `Akun ${localResult.username} berhasil direset pada penyimpanan lokal perangkat ini. Silakan masuk dengan kredensial baru.`,
+        fromOffline: true,
+      };
+    }
+
+    throw new Error('Layanan reset akun tidak tersedia.');
+  };
+
+  const resetLocalOfflineAuth = async () => {
+    await clearAllOfflineAuthAccounts();
+    await checkBootstrapStatus();
+    setAuthError(null);
+    setAuthNotice(
+      'Data akun lokal pada peramban ini telah direset. Anda dapat membuat ulang akun Administrator lokal atau masuk saat server terhubung.'
+    );
+  };
+
+  const uploadInstitutionImage = async (
+    field: 'logoUrl' | 'photoUrl',
+    dataUrl: string,
+    baseProfile?: InstitutionProfile
+  ): Promise<{ url: string; queuedOffline: boolean }> => {
+    const base = baseProfile || institution || EMPTY_INSTITUTION;
+    const optimisticInst: InstitutionProfile = {
+      ...base,
+      [field]: dataUrl,
+      createdBy: base.createdBy || appUser?.uid || '',
+      updatedBy: appUser?.uid || base.updatedBy || '',
+    };
+
+    setInstitution(optimisticInst);
+    await setOfflineKV('institution', optimisticInst);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{ url: string; institution: InstitutionProfile }>(
+          '/api/institution/upload',
+          {
+            method: 'POST',
+            body: { field, dataUrl },
+          }
+        );
+        const mergedInst: InstitutionProfile = {
+          ...optimisticInst,
+          [field]: res.url,
+        };
+        setInstitution(mergedInst);
+        await setOfflineKV('institution', mergedInst);
+        return { url: res.url, queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({
+      endpoint: '/api/institution',
+      method: 'PUT',
+      body: optimisticInst as unknown as Record<string, unknown>,
+    });
+    await refreshQueueCount();
+    return { url: dataUrl, queuedOffline: true };
   };
 
   const saveInstitution = async (
@@ -591,7 +865,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         await setOfflineKV('institution', res.institution);
         return { queuedOffline: false };
       } catch (err) {
-        if (!(err instanceof TypeError)) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
           throw err;
         }
       }
@@ -612,6 +886,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     position: string;
     currentPassword?: string;
     newPassword?: string;
+    recoveryCode?: string;
   }): Promise<{ queuedOffline: boolean }> => {
     if (!appUser) throw new Error('Pengguna tidak terautentikasi.');
 
@@ -621,10 +896,31 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         body: payload as unknown as Record<string, unknown>,
       });
       setAppUser(res.user);
-      if (payload.newPassword && res.user.username) {
-        await cacheOfflineAuthCredential(res.user.username, payload.newPassword, res.user);
-      }
+      await updateOfflineAuthUserMetadata(
+        res.user.uid,
+        res.user,
+        payload.newPassword || undefined,
+        payload.recoveryCode || undefined
+      );
       return { queuedOffline: false };
+    }
+
+    if (payload.newPassword && payload.newPassword.length > 0) {
+      const verify = await verifyOfflineAuthCredentialDetailed(
+        appUser.username || '',
+        payload.currentPassword || ''
+      );
+      if (verify.status !== 'ok') {
+        throw new Error('Kata sandi lama tidak sesuai.');
+      }
+      if (payload.newPassword.length < 6) {
+        throw new Error('Kata sandi baru minimal 6 karakter.');
+      }
+    }
+
+    const cleanRecovery = payload.recoveryCode?.trim() || undefined;
+    if (cleanRecovery && (cleanRecovery.length < 4 || cleanRecovery.length > 64)) {
+      throw new Error('Kode pemulihan harus 4 hingga 64 karakter.');
     }
 
     const updatedLocal: AppUser = {
@@ -632,7 +928,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       displayName: payload.displayName,
       phone: payload.phone,
       position: payload.position,
+      hasRecoveryCode: Boolean(appUser.hasRecoveryCode || cleanRecovery),
     };
+    await updateOfflineAuthUserMetadata(
+      appUser.uid,
+      updatedLocal,
+      payload.newPassword || undefined,
+      cleanRecovery
+    );
     setAppUser(updatedLocal);
     await enqueueOfflineMutation({
       endpoint: '/api/auth/me',
@@ -659,7 +962,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAuthNotice(null);
   };
 
-  // Initial dashboard fetch once authenticated
   useEffect(() => {
     if (appUser && appUser.status === 'active') {
       refreshDashboardData();
@@ -691,8 +993,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setupFirstAdmin,
         signInWithUsername,
         registerWithUsername,
+        recoverUsername,
+        resetAccountWithRecovery,
+        resetLocalOfflineAuth,
         signOutUser,
         apiRequest,
+        uploadInstitutionImage,
         saveInstitution,
         updateOwnProfile,
         refreshDashboardData,
