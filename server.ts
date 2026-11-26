@@ -576,12 +576,19 @@ async function startServer() {
     }
 
     if (user.status === 'pending') {
-      res.status(403).json({
-        code: 'ACCOUNT_PENDING',
-        error: 'Akun Anda berstatus Menunggu Aktivasi oleh Administrator.',
-        user: toPublicUser(user),
-      });
-      return;
+      if (user.role === 'Administrator') {
+        user.status = 'active';
+        user.updatedAt = new Date().toISOString();
+        user.updatedBy = user.uid;
+        writeStore(store);
+      } else {
+        res.status(403).json({
+          code: 'ACCOUNT_PENDING',
+          error: 'Akun Anda berstatus Menunggu Aktivasi oleh Administrator.',
+          user: toPublicUser(user),
+        });
+        return;
+      }
     }
 
     if (user.status === 'inactive') {
@@ -601,13 +608,21 @@ async function startServer() {
     });
   });
 
-  // 4. Register new user with Nama + Sandi (always Operator + pending, NEVER auto-admin)
+  // 4. Register new user with Nama + Sandi
+  // - If no active Administrator exists yet, the registered account becomes active Administrator immediately.
+  // - If requesting Administrator role when an Admin already exists, verify active Admin credentials or server passcode and activate immediately.
+  // - Otherwise registers as Operator with status 'pending'.
   app.post('/api/auth/register', (req, res) => {
     const username = sanitizeStr(req.body?.username, 80);
     const displayName = sanitizeStr(req.body?.displayName || username, 150);
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
     const recoveryCode =
       typeof req.body?.recoveryCode === 'string' ? req.body.recoveryCode.trim() : '';
+    const requestedRole: UserRole =
+      req.body?.role === 'Administrator' ? 'Administrator' : 'Operator';
+    const approverUsername = sanitizeStr(req.body?.approverUsername, 80);
+    const approverPassword =
+      typeof req.body?.approverPassword === 'string' ? req.body.approverPassword : '';
 
     if (username.length < 3 || !/^[a-zA-Z0-9_.\- ]+$/.test(username)) {
       res.status(400).json({
@@ -633,6 +648,42 @@ async function startServer() {
       return;
     }
 
+    const hasActiveAdmin = store.users.some(
+      (u) => u.role === 'Administrator' && u.status === 'active'
+    );
+
+    let assignedRole: UserRole = 'Operator';
+    let assignedStatus: UserStatus = 'pending';
+    let actorUidForAudit = '';
+
+    if (!hasActiveAdmin) {
+      assignedRole = 'Administrator';
+      assignedStatus = 'active';
+    } else if (requestedRole === 'Administrator') {
+      const matchedApprover = approverUsername
+        ? store.users.find(
+            (u) =>
+              u.username.toLowerCase() === approverUsername.toLowerCase() &&
+              u.role === 'Administrator' &&
+              u.status === 'active' &&
+              verifyPassword(approverPassword, u.passwordSalt, u.passwordHash)
+          )
+        : undefined;
+      const validPasscodeApprover =
+        Boolean(approverPassword) && verifyEnvPasscode(approverPassword);
+
+      if (!matchedApprover && !validPasscodeApprover) {
+        res.status(403).json({
+          error:
+            'Untuk langsung mengaktifkan akun Administrator baru, masukkan nama pengguna dan kata sandi Administrator yang sudah aktif (atau Kode Akses Server).',
+        });
+        return;
+      }
+      assignedRole = 'Administrator';
+      assignedStatus = 'active';
+      actorUidForAudit = matchedApprover?.uid || 'env-admin';
+    }
+
     const now = new Date().toISOString();
     const uid = `usr_${crypto.randomUUID()}`;
     const { salt, hash } = hashPassword(password);
@@ -644,24 +695,114 @@ async function startServer() {
       displayName: displayName || username,
       email: '',
       phone: '',
-      position: '',
-      role: 'Operator',
-      status: 'pending',
+      position: assignedRole === 'Administrator' ? 'Administrator Sistem' : '',
+      role: assignedRole,
+      status: assignedStatus,
       passwordSalt: salt,
       passwordHash: hash,
       ...(recovery ? { recoverySalt: recovery.salt, recoveryHash: recovery.hash } : {}),
       createdAt: now,
       updatedAt: now,
-      createdBy: uid,
-      updatedBy: uid,
+      createdBy: actorUidForAudit || uid,
+      updatedBy: actorUidForAudit || uid,
     };
 
     store.users.push(newUser);
+    if (assignedRole === 'Administrator' && assignedStatus === 'active') {
+      appendAudit(store, {
+        action: 'USER_ADMIN_DIRECT_ACTIVE',
+        entityType: 'users',
+        entityId: uid,
+        actorUid: actorUidForAudit || uid,
+        actorName: newUser.displayName,
+        details: `Akun Administrator ${username} dibuat dan langsung aktif tanpa persetujuan tertunda.`,
+      });
+    }
     writeStore(store);
 
+    if (assignedStatus === 'active') {
+      const token = signSessionToken(newUser.uid, newUser.role);
+      res.status(201).json({
+        autoActivated: true,
+        message: 'Akun Administrator berhasil dibuat dan langsung aktif.',
+        token,
+        user: toPublicUser(newUser),
+        institution: store.institution,
+      });
+      return;
+    }
+
     res.status(201).json({
+      autoActivated: false,
       message: 'Pendaftaran berhasil. Akun berstatus Menunggu Aktivasi dari Administrator.',
       user: toPublicUser(newUser),
+    });
+  });
+
+  // 4a. Activate a pending account directly using active Administrator credentials or server passcode
+  app.post('/api/auth/activate-pending', (req, res) => {
+    const targetUsername = sanitizeStr(req.body?.username, 80);
+    const approverUsername = sanitizeStr(req.body?.approverUsername, 80);
+    const approverPassword =
+      typeof req.body?.approverPassword === 'string' ? req.body.approverPassword : '';
+    const promoteToAdmin = Boolean(req.body?.promoteToAdmin);
+
+    if (!targetUsername || !approverPassword) {
+      res.status(400).json({
+        error: 'Nama akun dan kredensial Administrator aktif wajib diisi.',
+      });
+      return;
+    }
+
+    const store = readStore();
+    const target = store.users.find(
+      (u) => u.username.toLowerCase() === targetUsername.toLowerCase()
+    );
+    if (!target) {
+      res.status(404).json({ error: 'Akun tidak ditemukan.' });
+      return;
+    }
+
+    const matchedApprover = approverUsername
+      ? store.users.find(
+          (u) =>
+            u.username.toLowerCase() === approverUsername.toLowerCase() &&
+            u.role === 'Administrator' &&
+            u.status === 'active' &&
+            verifyPassword(approverPassword, u.passwordSalt, u.passwordHash)
+        )
+      : undefined;
+    const validPasscode = verifyEnvPasscode(approverPassword);
+
+    if (!matchedApprover && !validPasscode) {
+      res.status(403).json({
+        error: 'Nama pengguna atau kata sandi Administrator aktif tidak sesuai.',
+      });
+      return;
+    }
+
+    target.status = 'active';
+    if (promoteToAdmin) {
+      target.role = 'Administrator';
+      target.position = target.position || 'Administrator Sistem';
+    }
+    target.updatedAt = new Date().toISOString();
+    target.updatedBy = matchedApprover?.uid || 'env-admin';
+
+    appendAudit(store, {
+      action: 'USER_DIRECT_ACTIVATE',
+      entityType: 'users',
+      entityId: target.uid,
+      actorUid: matchedApprover?.uid || 'env-admin',
+      actorName: matchedApprover?.displayName || 'Administrator',
+      details: `Mengaktifkan akun ${target.username} sebagai ${target.role}.`,
+    });
+    writeStore(store);
+
+    res.json({
+      ok: true,
+      user: toPublicUser(target),
+      message: `Akun ${target.username} telah diaktifkan sebagai ${target.role}.`,
     });
   });
 
@@ -983,9 +1124,12 @@ async function startServer() {
     const role: UserRole = ['Administrator', 'Pimpinan', 'Operator'].includes(req.body?.role)
       ? req.body.role
       : 'Operator';
-    const status: UserStatus = ['active', 'pending', 'inactive'].includes(req.body?.status)
+    let status: UserStatus = ['active', 'pending', 'inactive'].includes(req.body?.status)
       ? req.body.status
       : 'active';
+    if (role === 'Administrator' && status === 'pending') {
+      status = 'active';
+    }
 
     if (username.length < 3 || !/^[a-zA-Z0-9_.\- ]+$/.test(username)) {
       res.status(400).json({ error: 'Nama pengguna minimal 3 karakter.' });
@@ -1076,9 +1220,12 @@ async function startServer() {
     const nextRole: UserRole = ['Administrator', 'Pimpinan', 'Operator'].includes(req.body?.role)
       ? req.body.role
       : target.role;
-    const nextStatus: UserStatus = ['active', 'pending', 'inactive'].includes(req.body?.status)
+    let nextStatus: UserStatus = ['active', 'pending', 'inactive'].includes(req.body?.status)
       ? req.body.status
       : target.status;
+    if (nextRole === 'Administrator' && nextStatus === 'pending') {
+      nextStatus = 'active';
+    }
 
     if (target.uid === actor.uid && nextStatus !== 'active') {
       res.status(400).json({ error: 'Anda tidak dapat menonaktifkan akun Anda sendiri.' });

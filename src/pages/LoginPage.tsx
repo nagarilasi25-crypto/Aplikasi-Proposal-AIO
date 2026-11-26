@@ -9,6 +9,7 @@ import {
   LogOut,
   RotateCcw,
   ShieldCheck,
+  UserCheck,
   UserPlus,
   UserSearch,
   WifiOff,
@@ -16,6 +17,7 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import { PWAInstallButton } from '../components/PWAInstallButton';
+import { UserRole } from '../types/models';
 
 type AuthMode = 'login' | 'register' | 'recover';
 type RecoverTab = 'username' | 'reset';
@@ -32,6 +34,7 @@ export function LoginPage() {
     setupFirstAdmin,
     signInWithUsername,
     registerWithUsername,
+    activatePendingWithAdminCredentials,
     recoverUsername,
     resetAccountWithRecovery,
     resetLocalOfflineAuth,
@@ -47,6 +50,11 @@ export function LoginPage() {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [recoveryCode, setRecoveryCode] = useState('');
+  const [registerRole, setRegisterRole] = useState<UserRole>('Operator');
+  const [approverUsername, setApproverUsername] = useState('');
+  const [approverPassword, setApproverPassword] = useState('');
+  const [promotePendingToAdmin, setPromotePendingToAdmin] = useState(true);
+  const [showPendingActivateForm, setShowPendingActivateForm] = useState(false);
 
   // Forgot username state
   const [lookupDisplayName, setLookupDisplayName] = useState('');
@@ -136,13 +144,42 @@ export function LoginPage() {
         setLocalError('Kode pemulihan akun minimal 4 karakter jika diisi.');
         return;
       }
+      if (registerRole === 'Administrator' && !approverPassword) {
+        setLocalError(
+          'Masukkan nama pengguna dan kata sandi Administrator yang sudah aktif (atau Kode Akses Server) agar akun Administrator baru langsung aktif.'
+        );
+        return;
+      }
       await registerWithUsername(
         username.trim(),
         displayName.trim() || username.trim(),
         password,
-        recoveryCode.trim() || undefined
+        recoveryCode.trim() || undefined,
+        {
+          role: registerRole,
+          approverUsername: approverUsername.trim() || undefined,
+          approverPassword: approverPassword || undefined,
+        }
       );
     }
+  };
+
+  const handlePendingDirectActivate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLocalError(null);
+    clearAuthMessages();
+    const targetUsername = pendingStatusUser?.username || username.trim();
+    if (!targetUsername || !approverPassword) {
+      setLocalError('Masukkan kredensial Administrator aktif untuk mengaktifkan akun ini.');
+      return;
+    }
+    await activatePendingWithAdminCredentials({
+      username: targetUsername,
+      password,
+      approverUsername: approverUsername.trim(),
+      approverPassword,
+      promoteToAdmin: promotePendingToAdmin,
+    });
   };
 
   const handleRecoverUsername = async (e: React.FormEvent) => {
@@ -297,14 +334,103 @@ export function LoginPage() {
                 Akun <span className="font-semibold text-[#111C18]">{pendingStatusUser?.username}</span> telah tercatat dengan peran dasar{' '}
                 <span className="font-semibold text-[#111C18]">{pendingStatusUser?.role}</span> dan menunggu persetujuan Administrator.
               </p>
-              <button
-                type="button"
-                onClick={signOutUser}
-                className="mt-6 inline-flex w-full items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
-              >
-                <LogOut className="h-4 w-4" />
-                Kembali ke Halaman Masuk
-              </button>
+
+              {(localError || authError) && (
+                <div
+                  role="alert"
+                  className="mt-4 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800"
+                >
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
+                  <span>{localError || authError}</span>
+                </div>
+              )}
+
+              {!showPendingActivateForm ? (
+                <div className="mt-5 space-y-2.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowPendingActivateForm(true);
+                      setLocalError(null);
+                      clearAuthMessages();
+                    }}
+                    className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[#0F3D2E] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#144D3A]"
+                  >
+                    <UserCheck className="h-4 w-4" />
+                    Aktifkan Langsung (Saya Administrator)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={signOutUser}
+                    className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    <LogOut className="h-4 w-4" />
+                    Kembali ke Halaman Masuk
+                  </button>
+                </div>
+              ) : (
+                <form
+                  onSubmit={handlePendingDirectActivate}
+                  className="mt-5 space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-4"
+                >
+                  <p className="text-xs font-semibold text-[#111C18]">
+                    Verifikasi Administrator Aktif
+                  </p>
+                  <p className="text-[11px] text-slate-600">
+                    Masukkan nama pengguna & kata sandi Administrator yang sudah aktif{hasEnvAdminPasscode ? ' (atau Kode Akses Server)' : ''} untuk langsung mengaktifkan akun <span className="font-mono font-semibold">{pendingStatusUser?.username}</span>.
+                  </p>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700">
+                      Nama Pengguna Administrator Aktif{hasEnvAdminPasscode ? ' (opsional jika pakai Kode Server)' : ''}
+                    </label>
+                    <input
+                      type="text"
+                      value={approverUsername}
+                      onChange={(e) => setApproverUsername(e.target.value)}
+                      placeholder="Contoh: Lasi atau admin"
+                      className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700">
+                      Kata Sandi Administrator{hasEnvAdminPasscode ? ' / Kode Akses Server' : ''}
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      value={approverPassword}
+                      onChange={(e) => setApproverPassword(e.target.value)}
+                      placeholder="Masukkan kata sandi Administrator"
+                      className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                    />
+                  </div>
+                  <label className="flex items-center gap-2 text-xs text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={promotePendingToAdmin}
+                      onChange={(e) => setPromotePendingToAdmin(e.target.checked)}
+                      className="h-4 w-4 rounded border-slate-300 text-[#0F3D2E] focus:ring-[#0F3D2E]"
+                    />
+                    <span>Aktifkan sebagai Administrator (langsung aktif)</span>
+                  </label>
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      type="submit"
+                      disabled={signingIn}
+                      className="flex-1 rounded-lg bg-[#0F3D2E] px-3 py-2 text-xs font-semibold text-white hover:bg-[#144D3A] disabled:opacity-60"
+                    >
+                      {signingIn ? 'Mengaktifkan...' : 'Aktifkan & Masuk'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowPendingActivateForm(false)}
+                      className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                    >
+                      Batal
+                    </button>
+                  </div>
+                </form>
+              )}
             </div>
           ) : isInactive ? (
             <div>
@@ -707,6 +833,58 @@ export function LoginPage() {
                           className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
                         />
                       </div>
+
+                      {!needsSetup && mode === 'register' && (
+                        <div className="space-y-3">
+                          <div>
+                            <label className="block text-xs font-medium text-slate-700">
+                              Peran yang Didaftarkan
+                            </label>
+                            <select
+                              value={registerRole}
+                              onChange={(e) => setRegisterRole(e.target.value as UserRole)}
+                              className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                            >
+                              <option value="Operator">Operator (Menunggu Aktivasi Administrator)</option>
+                              <option value="Administrator">Administrator (Langsung Aktif)</option>
+                            </select>
+                          </div>
+
+                          {registerRole === 'Administrator' && (
+                            <div className="rounded-lg border border-[#0F3D2E]/20 bg-[#0F3D2E]/5 p-3.5 space-y-2.5">
+                              <p className="text-xs font-semibold text-[#0F3D2E]">
+                                Verifikasi Administrator Aktif
+                              </p>
+                              <p className="text-[11px] leading-relaxed text-slate-600">
+                                Agar akun Administrator baru ini langsung aktif tanpa menunggu persetujuan, masukkan nama & sandi Administrator yang sudah ada{hasEnvAdminPasscode ? ' (atau Kode Akses Server)' : ''}.
+                              </p>
+                              <input
+                                type="text"
+                                value={approverUsername}
+                                onChange={(e) => setApproverUsername(e.target.value)}
+                                placeholder={
+                                  hasEnvAdminPasscode
+                                    ? 'Nama pengguna Admin aktif (opsional jika pakai Kode Server)'
+                                    : 'Nama pengguna Administrator yang sudah aktif'
+                                }
+                                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                              />
+                              <input
+                                type="password"
+                                required
+                                value={approverPassword}
+                                onChange={(e) => setApproverPassword(e.target.value)}
+                                placeholder={
+                                  hasEnvAdminPasscode
+                                    ? 'Kata sandi Admin aktif / Kode Akses Server'
+                                    : 'Kata sandi Administrator yang sudah aktif'
+                                }
+                                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+                              />
+                            </div>
+                          )}
+                        </div>
+                      )}
 
                       <div>
                         <label className="block text-xs font-medium text-slate-700">

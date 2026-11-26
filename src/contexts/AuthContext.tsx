@@ -5,6 +5,7 @@ import {
   InstitutionProfile,
   ProposalCategory,
   ProposalRecord,
+  UserRole,
 } from '../types/models';
 import {
   cacheDashboardSnapshot,
@@ -13,13 +14,14 @@ import {
   enqueueOfflineMutation,
   getOfflineKV,
   getOfflineMutationQueue,
-  hasAnyOfflineAccount,
+  hasActiveOfflineAdmin,
   hasOfflineUsername,
   recoverOfflineUsername,
   removeOfflineMutation,
   resetOfflineAccount,
   setOfflineKV,
   updateOfflineAuthUserMetadata,
+  verifyActiveOfflineAdmin,
   verifyOfflineAuthCredentialDetailed,
 } from '../lib/offlineDb';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
@@ -115,8 +117,20 @@ interface AuthContextValue {
     username: string,
     displayName: string,
     password: string,
-    recoveryCode?: string
+    recoveryCode?: string,
+    options?: {
+      role?: UserRole;
+      approverUsername?: string;
+      approverPassword?: string;
+    }
   ) => Promise<void>;
+  activatePendingWithAdminCredentials: (payload: {
+    username: string;
+    password: string;
+    approverUsername: string;
+    approverPassword: string;
+    promoteToAdmin: boolean;
+  }) => Promise<void>;
   recoverUsername: (
     displayName: string,
     secret: string
@@ -200,12 +214,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setHasEnvAdminPasscode(Boolean(parsed.data.hasEnvAdminPasscode));
         return;
       }
-      const hasLocal = await hasAnyOfflineAccount();
-      setNeedsSetup(!hasLocal);
+      const hasLocalAdmin = await hasActiveOfflineAdmin();
+      setNeedsSetup(!hasLocalAdmin);
       setHasEnvAdminPasscode(false);
     } catch {
-      const hasLocal = await hasAnyOfflineAccount();
-      setNeedsSetup(!hasLocal);
+      const hasLocalAdmin = await hasActiveOfflineAdmin();
+      setNeedsSetup(!hasLocalAdmin);
       setHasEnvAdminPasscode(false);
     } finally {
       await refreshQueueCount();
@@ -441,8 +455,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
 
       // Offline / static hosting fallback for initial setup
-      const hasLocal = await hasAnyOfflineAccount();
-      if (hasLocal) {
+      const hasLocalAdmin = await hasActiveOfflineAdmin();
+      if (hasLocalAdmin) {
         setNeedsSetup(false);
         setAuthError('Akun Administrator sudah terdaftar pada perangkat ini. Silakan masuk.');
         return;
@@ -553,7 +567,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (serverUnavailable) {
         const localCheck = await verifyOfflineAuthCredentialDetailed(username, password);
         if (localCheck.status === 'ok') {
-          if (localCheck.user.status === 'pending' || localCheck.user.status === 'inactive') {
+          if (localCheck.user.status === 'pending') {
+            if (localCheck.user.role === 'Administrator') {
+              const promoted =
+                (await updateOfflineAuthUserMetadata(localCheck.user.uid, {
+                  status: 'active',
+                  updatedBy: localCheck.user.uid,
+                })) || { ...localCheck.user, status: 'active' as const };
+              await applyLocalOfflineSession(promoted);
+              return;
+            }
+            setPendingStatusUser(localCheck.user);
+            return;
+          }
+          if (localCheck.user.status === 'inactive') {
             setPendingStatusUser(localCheck.user);
             return;
           }
@@ -579,80 +606,136 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     username: string,
     displayName: string,
     password: string,
-    recoveryCode?: string
+    recoveryCode?: string,
+    options?: {
+      role?: UserRole;
+      approverUsername?: string;
+      approverPassword?: string;
+    }
   ) => {
     setSigningIn(true);
     setAuthError(null);
     setAuthNotice(null);
     const cleanRecovery = recoveryCode?.trim() || undefined;
+    const requestedRole: UserRole = options?.role === 'Administrator' ? 'Administrator' : 'Operator';
+
     try {
-      if (!navigator.onLine) {
-        throw new Error('Pendaftaran akun baru memerlukan koneksi internet.');
+      let serverUnavailable = !navigator.onLine;
+
+      if (navigator.onLine) {
+        try {
+          const res = await fetch('/api/auth/register', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify({
+              username,
+              displayName,
+              password,
+              recoveryCode: cleanRecovery,
+              role: requestedRole,
+              approverUsername: options?.approverUsername?.trim() || undefined,
+              approverPassword: options?.approverPassword || undefined,
+            }),
+          });
+          const parsed = await parseJsonResponse<{
+            autoActivated?: boolean;
+            message?: string;
+            error?: unknown;
+            token?: string;
+            user?: AppUser;
+            institution?: InstitutionProfile;
+          }>(res);
+
+          const isEdgeOrProxyUnavailable =
+            !parsed.isJson || res.status === 404 || res.status >= 500;
+
+          if (!isEdgeOrProxyUnavailable) {
+            if (!parsed.ok) {
+              throw new Error(extractErrorMessage(parsed.data, 'Gagal mendaftarkan akun.'));
+            }
+            if (parsed.data?.autoActivated && parsed.data?.token && parsed.data?.user) {
+              await applyAuthenticatedSession(
+                username,
+                password,
+                parsed.data.token,
+                parsed.data.user,
+                parsed.data.institution || EMPTY_INSTITUTION,
+                cleanRecovery
+              );
+              return;
+            }
+            setAuthNotice(
+              parsed.data?.message ||
+                'Pendaftaran berhasil. Menunggu aktivasi oleh Administrator.'
+            );
+            return;
+          }
+          serverUnavailable = true;
+        } catch (err) {
+          if (!(err instanceof TypeError)) {
+            throw err;
+          }
+          serverUnavailable = true;
+        }
       }
-      const res = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({
-          username,
-          displayName,
-          password,
-          recoveryCode: cleanRecovery,
-        }),
-      });
-      const parsed = await parseJsonResponse<{
-        message?: string;
-        error?: unknown;
-        user?: AppUser;
-      }>(res);
 
-      const isEdgeOrProxyUnavailable =
-        !parsed.isJson || res.status === 404 || res.status >= 500;
+      if (serverUnavailable) {
+        const existsLocally = await hasOfflineUsername(username);
+        if (existsLocally) {
+          throw new Error('Nama pengguna tersebut sudah terdaftar. Gunakan nama lain.');
+        }
 
-      if (!isEdgeOrProxyUnavailable) {
-        if (!parsed.ok) {
-          throw new Error(extractErrorMessage(parsed.data, 'Gagal mendaftarkan akun.'));
+        const hasLocalAdmin = await hasActiveOfflineAdmin();
+        let assignedRole: UserRole = 'Operator';
+        let assignedStatus: 'active' | 'pending' = 'pending';
+
+        if (!hasLocalAdmin) {
+          assignedRole = 'Administrator';
+          assignedStatus = 'active';
+        } else if (requestedRole === 'Administrator') {
+          const validApprover = await verifyActiveOfflineAdmin(
+            options?.approverUsername || '',
+            options?.approverPassword || ''
+          );
+          if (!validApprover) {
+            throw new Error(
+              'Untuk langsung mengaktifkan akun Administrator baru, masukkan nama pengguna dan kata sandi Administrator yang sudah aktif.'
+            );
+          }
+          assignedRole = 'Administrator';
+          assignedStatus = 'active';
+        }
+
+        const now = new Date().toISOString();
+        const localUid =
+          assignedRole === 'Administrator' ? `local_admin_${Date.now()}` : `local_usr_${Date.now()}`;
+        const localUser: AppUser = {
+          uid: localUid,
+          username: username.trim(),
+          displayName: displayName.trim() || username.trim(),
+          email: '',
+          phone: '',
+          position: assignedRole === 'Administrator' ? 'Administrator Sistem' : '',
+          role: assignedRole,
+          status: assignedStatus,
+          hasRecoveryCode: Boolean(cleanRecovery && cleanRecovery.length >= 4),
+          createdAt: now,
+          updatedAt: now,
+          createdBy: localUid,
+          updatedBy: localUid,
+        };
+        await cacheOfflineAuthCredential(username, password, localUser, cleanRecovery);
+        if (assignedStatus === 'active') {
+          await applyLocalOfflineSession(localUser);
+          return;
         }
         setAuthNotice(
-          parsed.data?.message ||
-            'Pendaftaran berhasil. Menunggu aktivasi oleh Administrator.'
-        );
-        return;
-      }
-
-      const hasLocal = await hasAnyOfflineAccount();
-      if (!hasLocal) {
-        throw new Error(
-          'Layanan server sedang tidak tersedia. Muat ulang halaman atau coba beberapa saat lagi.'
+          'Pendaftaran dicatat pada perangkat ini dengan status Menunggu Aktivasi oleh Administrator.'
         );
       }
-      const existsLocally = await hasOfflineUsername(username);
-      if (existsLocally) {
-        throw new Error('Nama pengguna tersebut sudah terdaftar. Gunakan nama lain.');
-      }
-      const now = new Date().toISOString();
-      const localUid = `local_usr_${Date.now()}`;
-      const localPendingUser: AppUser = {
-        uid: localUid,
-        username: username.trim(),
-        displayName: displayName.trim() || username.trim(),
-        email: '',
-        phone: '',
-        position: '',
-        role: 'Operator',
-        status: 'pending',
-        hasRecoveryCode: Boolean(cleanRecovery && cleanRecovery.length >= 4),
-        createdAt: now,
-        updatedAt: now,
-        createdBy: localUid,
-        updatedBy: localUid,
-      };
-      await cacheOfflineAuthCredential(username, password, localPendingUser, cleanRecovery);
-      setAuthNotice(
-        'Pendaftaran dicatat pada perangkat ini dengan status Menunggu Aktivasi oleh Administrator.'
-      );
     } catch (err) {
       if (err instanceof TypeError) {
         setAuthError('Tidak dapat terhubung ke server pendaftaran. Periksa koneksi internet Anda.');
@@ -661,6 +744,105 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           extractErrorMessage(err instanceof Error ? err.message : err, 'Gagal mendaftarkan akun.')
         );
       }
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
+  const activatePendingWithAdminCredentials = async (payload: {
+    username: string;
+    password: string;
+    approverUsername: string;
+    approverPassword: string;
+    promoteToAdmin: boolean;
+  }) => {
+    setSigningIn(true);
+    setAuthError(null);
+    setAuthNotice(null);
+    try {
+      let serverUnavailable = !navigator.onLine;
+      if (navigator.onLine) {
+        try {
+          const res = await fetch('/api/auth/activate-pending', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify({
+              username: payload.username,
+              approverUsername: payload.approverUsername,
+              approverPassword: payload.approverPassword,
+              promoteToAdmin: payload.promoteToAdmin,
+            }),
+          });
+          const parsed = await parseJsonResponse<{
+            ok?: boolean;
+            user?: AppUser;
+            error?: unknown;
+          }>(res);
+          const isEdgeOrProxyUnavailable =
+            !parsed.isJson || res.status === 404 || res.status >= 500;
+          if (!isEdgeOrProxyUnavailable) {
+            if (!parsed.ok) {
+              throw new Error(
+                extractErrorMessage(parsed.data, 'Kredensial Administrator tidak sesuai.')
+              );
+            }
+            if (payload.password) {
+              await signInWithUsername(payload.username, payload.password);
+            } else {
+              setPendingStatusUser(null);
+              setAuthNotice(`Akun ${payload.username} telah diaktifkan. Silakan masuk.`);
+            }
+            return;
+          }
+          serverUnavailable = true;
+        } catch (err) {
+          if (!(err instanceof TypeError)) {
+            throw err;
+          }
+          serverUnavailable = true;
+        }
+      }
+
+      if (serverUnavailable) {
+        const validApprover = await verifyActiveOfflineAdmin(
+          payload.approverUsername,
+          payload.approverPassword
+        );
+        if (!validApprover) {
+          throw new Error('Nama pengguna atau kata sandi Administrator aktif tidak sesuai.');
+        }
+        const localCheck = await verifyOfflineAuthCredentialDetailed(
+          payload.username,
+          payload.password
+        );
+        if (localCheck.status !== 'ok') {
+          throw new Error('Akun tidak ditemukan pada penyimpanan lokal perangkat ini.');
+        }
+        const updated =
+          (await updateOfflineAuthUserMetadata(localCheck.user.uid, {
+            status: 'active',
+            role: payload.promoteToAdmin ? 'Administrator' : localCheck.user.role,
+            position: payload.promoteToAdmin
+              ? localCheck.user.position || 'Administrator Sistem'
+              : localCheck.user.position,
+            updatedBy: validApprover.uid,
+          })) || {
+            ...localCheck.user,
+            status: 'active' as const,
+            role: payload.promoteToAdmin ? ('Administrator' as const) : localCheck.user.role,
+          };
+        await applyLocalOfflineSession(updated);
+      }
+    } catch (err) {
+      setAuthError(
+        extractErrorMessage(
+          err instanceof Error ? err.message : err,
+          'Gagal mengaktifkan akun.'
+        )
+      );
     } finally {
       setSigningIn(false);
     }
@@ -993,6 +1175,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setupFirstAdmin,
         signInWithUsername,
         registerWithUsername,
+        activatePendingWithAdminCredentials,
         recoverUsername,
         resetAccountWithRecovery,
         resetLocalOfflineAuth,

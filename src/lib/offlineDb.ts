@@ -206,6 +206,27 @@ export async function hasAnyOfflineAccount(): Promise<boolean> {
   });
 }
 
+export async function hasActiveOfflineAdmin(): Promise<boolean> {
+  if (typeof indexedDB === 'undefined') return false;
+  const users = await getAllOfflineUsers();
+  return users.some((u) => u.role === 'Administrator' && u.status === 'active');
+}
+
+export async function verifyActiveOfflineAdmin(
+  username: string,
+  password: string
+): Promise<AppUser | null> {
+  const res = await verifyOfflineAuthCredentialDetailed(username, password);
+  if (
+    res.status === 'ok' &&
+    res.user.role === 'Administrator' &&
+    res.user.status === 'active'
+  ) {
+    return res.user;
+  }
+  return null;
+}
+
 export async function getAllOfflineUsers(): Promise<AppUser[]> {
   if (typeof indexedDB === 'undefined') return [];
   const db = await openOfflineDb();

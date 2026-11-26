@@ -674,7 +674,17 @@ export function UsersManagementPage() {
                   <label className="block text-xs font-medium text-slate-700">Peran</label>
                   <select
                     value={addForm.role}
-                    onChange={(e) => setAddForm({ ...addForm, role: e.target.value as UserRole })}
+                    onChange={(e) => {
+                      const nextRole = e.target.value as UserRole;
+                      setAddForm({
+                        ...addForm,
+                        role: nextRole,
+                        status:
+                          nextRole === 'Administrator' && addForm.status === 'pending'
+                            ? 'active'
+                            : addForm.status,
+                      });
+                    }}
                     className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
                   >
                     <option value="Operator">Operator</option>
@@ -685,12 +695,14 @@ export function UsersManagementPage() {
                 <div>
                   <label className="block text-xs font-medium text-slate-700">Status</label>
                   <select
-                    value={addForm.status}
+                    value={addForm.role === 'Administrator' && addForm.status === 'pending' ? 'active' : addForm.status}
                     onChange={(e) => setAddForm({ ...addForm, status: e.target.value as UserStatus })}
                     className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
                   >
                     <option value="active">Aktif</option>
-                    <option value="pending">Menunggu Aktivasi</option>
+                    {addForm.role !== 'Administrator' && (
+                      <option value="pending">Menunggu Aktivasi</option>
+                    )}
                     <option value="inactive">Nonaktif</option>
                   </select>
                 </div>
@@ -793,7 +805,17 @@ export function UsersManagementPage() {
                   <label className="block text-xs font-medium text-slate-700">Peran (Role)</label>
                   <select
                     value={editForm.role}
-                    onChange={(e) => setEditForm({ ...editForm, role: e.target.value as UserRole })}
+                    onChange={(e) => {
+                      const nextRole = e.target.value as UserRole;
+                      setEditForm({
+                        ...editForm,
+                        role: nextRole,
+                        status:
+                          nextRole === 'Administrator' && editForm.status === 'pending'
+                            ? 'active'
+                            : editForm.status,
+                      });
+                    }}
                     className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
                   >
                     <option value="Operator">Operator</option>
@@ -804,7 +826,11 @@ export function UsersManagementPage() {
                 <div>
                   <label className="block text-xs font-medium text-slate-700">Status</label>
                   <select
-                    value={editForm.status}
+                    value={
+                      editForm.role === 'Administrator' && editForm.status === 'pending'
+                        ? 'active'
+                        : editForm.status
+                    }
                     disabled={editingUser.uid === appUser.uid}
                     onChange={(e) =>
                       setEditForm({ ...editForm, status: e.target.value as UserStatus })
@@ -812,7 +838,9 @@ export function UsersManagementPage() {
                     className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none disabled:bg-slate-50"
                   >
                     <option value="active">Aktif</option>
-                    <option value="pending">Menunggu Aktivasi</option>
+                    {editForm.role !== 'Administrator' && (
+                      <option value="pending">Menunggu Aktivasi</option>
+                    )}
                     <option value="inactive">Nonaktif</option>
                   </select>
                 </div>
