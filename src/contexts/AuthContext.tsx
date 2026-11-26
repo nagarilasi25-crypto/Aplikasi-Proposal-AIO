@@ -27,6 +27,30 @@ interface ParsedApiResponse<T> {
   data: T | null;
 }
 
+function extractErrorMessage(payload: unknown, fallback: string): string {
+  if (!payload) return fallback;
+  if (typeof payload === 'string') {
+    const clean = payload.trim();
+    return clean && clean !== '[object Object]' ? clean : fallback;
+  }
+  if (typeof payload === 'object') {
+    const obj = payload as Record<string, unknown>;
+    if (typeof obj.error === 'string' && obj.error.trim()) {
+      return obj.error.trim();
+    }
+    if (obj.error && typeof obj.error === 'object') {
+      const nested = obj.error as Record<string, unknown>;
+      if (typeof nested.message === 'string' && nested.message.trim()) {
+        return nested.message.trim();
+      }
+    }
+    if (typeof obj.message === 'string' && obj.message.trim()) {
+      return obj.message.trim();
+    }
+  }
+  return fallback;
+}
+
 async function parseJsonResponse<T = Record<string, unknown>>(
   res: Response
 ): Promise<ParsedApiResponse<T>> {
@@ -177,12 +201,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         body: options?.body ? JSON.stringify(options.body) : undefined,
       });
 
-      const parsed = await parseJsonResponse<T & { error?: string }>(res);
+      const parsed = await parseJsonResponse<T & { error?: unknown }>(res);
       if (!parsed.isJson) {
         throw new Error('Layanan server tidak merespons dengan benar. Coba beberapa saat lagi.');
       }
       if (!parsed.ok) {
-        throw new Error(parsed.data?.error || 'Permintaan gagal diproses.');
+        throw new Error(extractErrorMessage(parsed.data, 'Permintaan gagal diproses.'));
       }
       return parsed.data as T;
     },
@@ -294,33 +318,44 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAuthNotice(null);
     try {
       if (navigator.onLine) {
-        const res = await fetch('/api/auth/setup', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify({ username, displayName, password }),
-        });
-        const parsed = await parseJsonResponse<{
-          token?: string;
-          user?: AppUser;
-          institution?: InstitutionProfile;
-          error?: string;
-        }>(res);
+        try {
+          const res = await fetch('/api/auth/setup', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify({ username, displayName, password }),
+          });
+          const parsed = await parseJsonResponse<{
+            token?: string;
+            user?: AppUser;
+            institution?: InstitutionProfile;
+            error?: unknown;
+          }>(res);
 
-        if (parsed.isJson) {
-          if (!parsed.ok || !parsed.data?.token || !parsed.data?.user) {
-            throw new Error(parsed.data?.error || 'Gagal membuat akun Administrator pertama.');
+          const isEdgeOrProxyUnavailable =
+            !parsed.isJson || res.status === 404 || res.status >= 500;
+
+          if (!isEdgeOrProxyUnavailable) {
+            if (!parsed.ok || !parsed.data?.token || !parsed.data?.user) {
+              throw new Error(
+                extractErrorMessage(parsed.data, 'Gagal membuat akun Administrator pertama.')
+              );
+            }
+            await applyAuthenticatedSession(
+              username,
+              password,
+              parsed.data.token,
+              parsed.data.user,
+              parsed.data.institution || EMPTY_INSTITUTION
+            );
+            return;
           }
-          await applyAuthenticatedSession(
-            username,
-            password,
-            parsed.data.token,
-            parsed.data.user,
-            parsed.data.institution || EMPTY_INSTITUTION
-          );
-          return;
+        } catch (err) {
+          if (!(err instanceof TypeError)) {
+            throw err;
+          }
         }
       }
 
@@ -353,9 +388,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       await applyLocalOfflineSession(localAdmin);
     } catch (err) {
       setAuthError(
-        err instanceof Error
-          ? err.message
-          : 'Tidak dapat terhubung ke server untuk pengaturan awal.'
+        extractErrorMessage(
+          err instanceof Error ? err.message : err,
+          'Tidak dapat terhubung ke server untuk pengaturan awal.'
+        )
       );
     } finally {
       setSigningIn(false);
@@ -381,13 +417,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         });
         const parsed = await parseJsonResponse<{
           code?: string;
-          error?: string;
+          error?: unknown;
           token?: string;
           user?: AppUser;
           institution?: InstitutionProfile;
         }>(res);
 
-        if (parsed.isJson) {
+        const isEdgeOrProxyUnavailable =
+          !parsed.isJson || res.status === 404 || res.status >= 500;
+
+        if (!isEdgeOrProxyUnavailable) {
           if (!parsed.ok) {
             if (
               (parsed.data?.code === 'ACCOUNT_PENDING' ||
@@ -397,7 +436,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               setPendingStatusUser(parsed.data.user);
               return;
             }
-            throw new Error(parsed.data?.error || 'Nama atau kata sandi tidak sesuai.');
+            throw new Error(
+              extractErrorMessage(parsed.data, 'Nama atau kata sandi tidak sesuai.')
+            );
           }
           if (!parsed.data?.token || !parsed.data?.user) {
             throw new Error('Respons autentikasi dari server tidak lengkap.');
@@ -412,13 +453,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           return;
         }
 
-        // Proxy/CDN returned non-JSON (e.g. 404 "The page could not be found" or 502/503)
+        // Proxy/CDN returned 404/5xx or non-JSON (e.g. static preview or cold-start)
         serverUnavailable = true;
       }
     } catch (err) {
       const isNetworkIssue = !navigator.onLine || err instanceof TypeError;
       if (!isNetworkIssue) {
-        setAuthError(err instanceof Error ? err.message : 'Gagal masuk ke sistem.');
+        setAuthError(
+          extractErrorMessage(err instanceof Error ? err.message : err, 'Gagal masuk ke sistem.')
+        );
         setSigningIn(false);
         return;
       }
@@ -470,13 +513,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
       const parsed = await parseJsonResponse<{
         message?: string;
-        error?: string;
+        error?: unknown;
         user?: AppUser;
       }>(res);
 
-      if (parsed.isJson) {
+      const isEdgeOrProxyUnavailable =
+        !parsed.isJson || res.status === 404 || res.status >= 500;
+
+      if (!isEdgeOrProxyUnavailable) {
         if (!parsed.ok) {
-          throw new Error(parsed.data?.error || 'Gagal mendaftarkan akun.');
+          throw new Error(extractErrorMessage(parsed.data, 'Gagal mendaftarkan akun.'));
         }
         setAuthNotice(
           parsed.data?.message ||
@@ -485,7 +531,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // Non-JSON response (e.g., static preview / server endpoint unavailable)
+      // Non-JSON / 404 / 5xx proxy response (e.g., static preview / server endpoint unavailable)
       const hasLocal = await hasAnyOfflineAccount();
       if (!hasLocal) {
         throw new Error(
@@ -520,7 +566,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (err instanceof TypeError) {
         setAuthError('Tidak dapat terhubung ke server pendaftaran. Periksa koneksi internet Anda.');
       } else {
-        setAuthError(err instanceof Error ? err.message : 'Gagal mendaftarkan akun.');
+        setAuthError(
+          extractErrorMessage(err instanceof Error ? err.message : err, 'Gagal mendaftarkan akun.')
+        );
       }
     } finally {
       setSigningIn(false);

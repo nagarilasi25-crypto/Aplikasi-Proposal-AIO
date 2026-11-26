@@ -331,7 +331,7 @@ async function startServer() {
     const hasActiveAdmin = store.users.some(
       (u) => u.role === 'Administrator' && u.status === 'active'
     );
-    const needsSetup = !ENV_ADMIN_PASSCODE && !hasActiveAdmin;
+    const needsSetup = !hasActiveAdmin;
     res.json({
       needsSetup,
       hasEnvAdminPasscode: Boolean(ENV_ADMIN_PASSCODE),
@@ -340,13 +340,6 @@ async function startServer() {
 
   // 2. First-run admin claim (Nama + Sandi, no email required)
   app.post('/api/auth/setup', (req, res) => {
-    if (ENV_ADMIN_PASSCODE) {
-      res.status(409).json({
-        error: 'Sandi Administrator telah dikonfigurasi melalui variabel lingkungan server.',
-      });
-      return;
-    }
-
     const store = readStore();
     const hasActiveAdmin = store.users.some(
       (u) => u.role === 'Administrator' && u.status === 'active'
