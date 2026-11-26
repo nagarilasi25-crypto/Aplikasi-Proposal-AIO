@@ -1,12 +1,26 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import {
+  AiNarrativeRequest,
+  AiNarrativeResponse,
   AppUser,
+  AuditLogRecord,
   DEFAULT_INSTITUTION_SEED,
   InstitutionProfile,
+  ProposalAttachment,
+  ProposalBudget,
   ProposalCategory,
   ProposalRecord,
+  ProposalStatus,
+  ProposalStatusHistory,
+  ProposalTemplate,
+  SystemAppSettings,
   UserRole,
 } from '../types/models';
+import {
+  createInitialCategories,
+  createInitialTemplates,
+  DEFAULT_APP_SETTINGS,
+} from '../lib/defaultSeeds';
 import {
   cacheDashboardSnapshot,
   cacheOfflineAuthCredential,
@@ -95,6 +109,11 @@ interface AuthContextValue {
   institution: InstitutionProfile | null;
   proposals: ProposalRecord[];
   categories: ProposalCategory[];
+  templates: ProposalTemplate[];
+  budgets: ProposalBudget[];
+  attachments: ProposalAttachment[];
+  statusHistory: ProposalStatusHistory[];
+  appSettings: SystemAppSettings;
   authLoading: boolean;
   institutionLoading: boolean;
   signingIn: boolean;
@@ -165,6 +184,50 @@ interface AuthContextValue {
     recoveryCode?: string;
   }) => Promise<{ queuedOffline: boolean }>;
   refreshDashboardData: () => Promise<void>;
+  generateAiNarrative: (payload: AiNarrativeRequest) => Promise<AiNarrativeResponse>;
+  saveCategory: (
+    payload: Partial<ProposalCategory> & { name: string }
+  ) => Promise<{ category: ProposalCategory; queuedOffline: boolean }>;
+  deleteCategory: (id: string) => Promise<{ queuedOffline: boolean }>;
+  saveTemplate: (
+    payload: Partial<ProposalTemplate> & { name: string }
+  ) => Promise<{ template: ProposalTemplate; queuedOffline: boolean }>;
+  duplicateTemplate: (id: string) => Promise<{ template: ProposalTemplate; queuedOffline: boolean }>;
+  deleteTemplate: (id: string) => Promise<{ queuedOffline: boolean }>;
+  saveProposal: (
+    payload: Partial<ProposalRecord> & { title: string }
+  ) => Promise<{ proposal: ProposalRecord; queuedOffline: boolean }>;
+  duplicateProposal: (id: string) => Promise<{ proposal: ProposalRecord; queuedOffline: boolean }>;
+  updateProposalStatus: (
+    id: string,
+    payload: {
+      status: ProposalStatus;
+      approvedAmount?: number;
+      receivedAmount?: number;
+      notes?: string;
+    }
+  ) => Promise<{ proposal: ProposalRecord; queuedOffline: boolean }>;
+  deleteProposal: (id: string) => Promise<{ queuedOffline: boolean }>;
+  saveBudget: (
+    payload: Partial<ProposalBudget> & { proposalId: string }
+  ) => Promise<{ budget: ProposalBudget; queuedOffline: boolean }>;
+  deleteBudget: (id: string) => Promise<{ queuedOffline: boolean }>;
+  createAttachment: (payload: {
+    proposalId?: string;
+    proposalTitle?: string;
+    category: ProposalAttachment['category'];
+    title: string;
+    description?: string;
+    dataUrl: string;
+    fileName: string;
+    mimeType: string;
+    fileSize: number;
+    isImage: boolean;
+  }) => Promise<{ attachment: ProposalAttachment; queuedOffline: boolean }>;
+  deleteAttachment: (id: string) => Promise<{ queuedOffline: boolean }>;
+  saveAppSettings: (payload: SystemAppSettings) => Promise<{ queuedOffline: boolean }>;
+  fetchAuditLogs: () => Promise<AuditLogRecord[]>;
+  exportBackupSnapshot: () => Promise<Record<string, unknown>>;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -182,6 +245,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [institution, setInstitution] = useState<InstitutionProfile | null>(null);
   const [proposals, setProposals] = useState<ProposalRecord[]>([]);
   const [categories, setCategories] = useState<ProposalCategory[]>([]);
+  const [templates, setTemplates] = useState<ProposalTemplate[]>([]);
+  const [budgets, setBudgets] = useState<ProposalBudget[]>([]);
+  const [attachments, setAttachments] = useState<ProposalAttachment[]>([]);
+  const [statusHistory, setStatusHistory] = useState<ProposalStatusHistory[]>([]);
+  const [appSettings, setAppSettings] = useState<SystemAppSettings>(DEFAULT_APP_SETTINGS);
 
   const [authLoading, setAuthLoading] = useState(true);
   const [institutionLoading, setInstitutionLoading] = useState(false);
@@ -270,6 +338,40 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [sessionToken]
   );
 
+  const loadOfflineCollections = useCallback(async () => {
+    const [
+      cachedInst,
+      cachedProps,
+      cachedCats,
+      cachedTpls,
+      cachedBudgets,
+      cachedAtts,
+      cachedHist,
+      cachedSettings,
+    ] = await Promise.all([
+      getOfflineKV<InstitutionProfile>('institution'),
+      getOfflineKV<ProposalRecord[]>('proposals'),
+      getOfflineKV<ProposalCategory[]>('categories'),
+      getOfflineKV<ProposalTemplate[]>('templates'),
+      getOfflineKV<ProposalBudget[]>('budgets'),
+      getOfflineKV<ProposalAttachment[]>('attachments'),
+      getOfflineKV<ProposalStatusHistory[]>('statusHistory'),
+      getOfflineKV<SystemAppSettings>('appSettings'),
+    ]);
+    setInstitution(cachedInst || EMPTY_INSTITUTION);
+    setProposals(cachedProps || []);
+    setCategories(
+      cachedCats && cachedCats.length > 0 ? cachedCats : createInitialCategories()
+    );
+    setTemplates(
+      cachedTpls && cachedTpls.length > 0 ? cachedTpls : createInitialTemplates('system')
+    );
+    setBudgets(cachedBudgets || []);
+    setAttachments(cachedAtts || []);
+    setStatusHistory(cachedHist || []);
+    setAppSettings(cachedSettings || DEFAULT_APP_SETTINGS);
+  }, []);
+
   const refreshDashboardData = useCallback(async () => {
     setInstitutionLoading(true);
     try {
@@ -278,6 +380,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           institution: InstitutionProfile;
           proposals: ProposalRecord[];
           categories: ProposalCategory[];
+          templates?: ProposalTemplate[];
+          budgets?: ProposalBudget[];
+          attachments?: ProposalAttachment[];
+          statusHistory?: ProposalStatusHistory[];
+          appSettings?: SystemAppSettings;
         }>('/api/dashboard-data');
 
         // Preserve any locally queued institution draft until queue flush finishes
@@ -287,38 +394,41 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           ? await getOfflineKV<InstitutionProfile>('institution')
           : null;
         const effectiveInst = cachedInst || data.institution || EMPTY_INSTITUTION;
+        const effectiveCats = data.categories || [];
+        const effectiveTpls = data.templates || [];
+        const effectiveBudgets = data.budgets || [];
+        const effectiveAtts = data.attachments || [];
+        const effectiveHist = data.statusHistory || [];
+        const effectiveSettings = data.appSettings || DEFAULT_APP_SETTINGS;
 
         setInstitution(effectiveInst);
         setProposals(data.proposals || []);
-        setCategories(data.categories || []);
+        setCategories(effectiveCats);
+        setTemplates(effectiveTpls);
+        setBudgets(effectiveBudgets);
+        setAttachments(effectiveAtts);
+        setStatusHistory(effectiveHist);
+        setAppSettings(effectiveSettings);
+
         await cacheDashboardSnapshot({
           institution: effectiveInst,
           proposals: data.proposals || [],
-          categories: data.categories || [],
+          categories: effectiveCats,
+          templates: effectiveTpls,
+          budgets: effectiveBudgets,
+          attachments: effectiveAtts,
+          statusHistory: effectiveHist,
+          appSettings: effectiveSettings,
         });
       } else {
-        const [cachedInst, cachedProps, cachedCats] = await Promise.all([
-          getOfflineKV<InstitutionProfile>('institution'),
-          getOfflineKV<ProposalRecord[]>('proposals'),
-          getOfflineKV<ProposalCategory[]>('categories'),
-        ]);
-        setInstitution(cachedInst || EMPTY_INSTITUTION);
-        setProposals(cachedProps || []);
-        setCategories(cachedCats || []);
+        await loadOfflineCollections();
       }
     } catch {
-      const [cachedInst, cachedProps, cachedCats] = await Promise.all([
-        getOfflineKV<InstitutionProfile>('institution'),
-        getOfflineKV<ProposalRecord[]>('proposals'),
-        getOfflineKV<ProposalCategory[]>('categories'),
-      ]);
-      setInstitution(cachedInst || EMPTY_INSTITUTION);
-      setProposals(cachedProps || []);
-      setCategories(cachedCats || []);
+      await loadOfflineCollections();
     } finally {
       setInstitutionLoading(false);
     }
-  }, [apiRequest, isOnline, sessionToken]);
+  }, [apiRequest, isOnline, loadOfflineCollections, sessionToken]);
 
   // Flush queued offline mutations automatically when internet & session token are available
   useEffect(() => {
@@ -1132,12 +1242,719 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return { queuedOffline: true };
   };
 
+  const generateAiNarrative = async (
+    payload: AiNarrativeRequest
+  ): Promise<AiNarrativeResponse> => {
+    if (!navigator.onLine || !sessionToken) {
+      throw new Error(
+        'Pembuatan narasi menggunakan AI memerlukan koneksi internet dan sesi server yang aktif.'
+      );
+    }
+    return apiRequest<AiNarrativeResponse>('/api/ai/generate-narrative', {
+      method: 'POST',
+      body: payload as unknown as Record<string, unknown>,
+    });
+  };
+
+  const saveCategory = async (
+    payload: Partial<ProposalCategory> & { name: string }
+  ): Promise<{ category: ProposalCategory; queuedOffline: boolean }> => {
+    const isEdit = Boolean(payload.id && categories.some((c) => c.id === payload.id));
+    const now = new Date().toISOString();
+    const localCat: ProposalCategory = {
+      id: payload.id || `cat_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      institutionId: 'ar-raudhah',
+      name: payload.name.trim(),
+      code: (payload.code || payload.name.slice(0, 3)).toUpperCase(),
+      description: payload.description || '',
+      isActive: payload.isActive !== false,
+      createdAt: payload.createdAt || now,
+      updatedAt: now,
+    };
+
+    const nextCats = isEdit
+      ? categories.map((c) => (c.id === localCat.id ? localCat : c))
+      : [...categories, localCat];
+    setCategories(nextCats);
+    await setOfflineKV('categories', nextCats);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{ category: ProposalCategory }>(
+          isEdit ? `/api/categories/${localCat.id}` : '/api/categories',
+          {
+            method: isEdit ? 'PUT' : 'POST',
+            body: localCat as unknown as Record<string, unknown>,
+          }
+        );
+        const synced = isEdit
+          ? categories.map((c) => (c.id === res.category.id ? res.category : c))
+          : [...categories, res.category];
+        setCategories(synced);
+        await setOfflineKV('categories', synced);
+        return { category: res.category, queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({
+      endpoint: isEdit ? `/api/categories/${localCat.id}` : '/api/categories',
+      method: isEdit ? 'PUT' : 'POST',
+      body: localCat as unknown as Record<string, unknown>,
+    });
+    await refreshQueueCount();
+    return { category: localCat, queuedOffline: true };
+  };
+
+  const deleteCategory = async (id: string): Promise<{ queuedOffline: boolean }> => {
+    const nextCats = categories.filter((c) => c.id !== id);
+    setCategories(nextCats);
+    await setOfflineKV('categories', nextCats);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        await apiRequest(`/api/categories/${id}`, { method: 'DELETE' });
+        return { queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({ endpoint: `/api/categories/${id}`, method: 'DELETE', body: {} });
+    await refreshQueueCount();
+    return { queuedOffline: true };
+  };
+
+  const saveTemplate = async (
+    payload: Partial<ProposalTemplate> & { name: string }
+  ): Promise<{ template: ProposalTemplate; queuedOffline: boolean }> => {
+    const isEdit = Boolean(payload.id && templates.some((t) => t.id === payload.id));
+    const now = new Date().toISOString();
+    const localTpl: ProposalTemplate = {
+      id: payload.id || `tpl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      institutionId: 'ar-raudhah',
+      name: payload.name.trim(),
+      proposalType: payload.proposalType || 'Umum',
+      description: payload.description || '',
+      sections: payload.sections || [],
+      isDefault: Boolean(payload.isDefault),
+      isActive: payload.isActive !== false,
+      createdAt: payload.createdAt || now,
+      updatedAt: now,
+      createdBy: payload.createdBy || appUser?.uid || '',
+      updatedBy: appUser?.uid || '',
+    };
+
+    const nextTpls = isEdit
+      ? templates.map((t) => (t.id === localTpl.id ? localTpl : t))
+      : [...templates, localTpl];
+    setTemplates(nextTpls);
+    await setOfflineKV('templates', nextTpls);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{ template: ProposalTemplate }>(
+          isEdit ? `/api/templates/${localTpl.id}` : '/api/templates',
+          {
+            method: isEdit ? 'PUT' : 'POST',
+            body: localTpl as unknown as Record<string, unknown>,
+          }
+        );
+        const synced = isEdit
+          ? templates.map((t) => (t.id === res.template.id ? res.template : t))
+          : [...templates, res.template];
+        setTemplates(synced);
+        await setOfflineKV('templates', synced);
+        return { template: res.template, queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({
+      endpoint: isEdit ? `/api/templates/${localTpl.id}` : '/api/templates',
+      method: isEdit ? 'PUT' : 'POST',
+      body: localTpl as unknown as Record<string, unknown>,
+    });
+    await refreshQueueCount();
+    return { template: localTpl, queuedOffline: true };
+  };
+
+  const duplicateTemplate = async (
+    id: string
+  ): Promise<{ template: ProposalTemplate; queuedOffline: boolean }> => {
+    const src = templates.find((t) => t.id === id);
+    if (!src) throw new Error('Template sumber tidak ditemukan.');
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{ template: ProposalTemplate }>(
+          `/api/templates/${id}/duplicate`,
+          { method: 'POST', body: {} }
+        );
+        const nextTpls = [...templates, res.template];
+        setTemplates(nextTpls);
+        await setOfflineKV('templates', nextTpls);
+        return { template: res.template, queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    const now = new Date().toISOString();
+    const copy: ProposalTemplate = {
+      ...src,
+      id: `tpl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name: `${src.name} (Salinan)`,
+      isDefault: false,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: appUser?.uid || '',
+      updatedBy: appUser?.uid || '',
+    };
+    return saveTemplate(copy);
+  };
+
+  const deleteTemplate = async (id: string): Promise<{ queuedOffline: boolean }> => {
+    const nextTpls = templates.filter((t) => t.id !== id);
+    setTemplates(nextTpls);
+    await setOfflineKV('templates', nextTpls);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        await apiRequest(`/api/templates/${id}`, { method: 'DELETE' });
+        return { queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({ endpoint: `/api/templates/${id}`, method: 'DELETE', body: {} });
+    await refreshQueueCount();
+    return { queuedOffline: true };
+  };
+
+  const saveProposal = async (
+    payload: Partial<ProposalRecord> & { title: string }
+  ): Promise<{ proposal: ProposalRecord; queuedOffline: boolean }> => {
+    const isEdit = Boolean(payload.id && proposals.some((p) => p.id === payload.id));
+    const existing = isEdit ? proposals.find((p) => p.id === payload.id) : undefined;
+    const now = new Date().toISOString();
+    const localId = payload.id || `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+    const linkedBudget = budgets.find((b) => b.proposalId === localId);
+    const localProposal: ProposalRecord = {
+      id: localId,
+      institutionId: 'ar-raudhah',
+      proposalNumber: payload.proposalNumber ?? existing?.proposalNumber ?? '',
+      proposalDate: payload.proposalDate ?? existing?.proposalDate ?? now.slice(0, 10),
+      fiscalYear: payload.fiscalYear ?? existing?.fiscalYear ?? appSettings.defaultFiscalYear,
+      title: payload.title.trim(),
+      categoryId: payload.categoryId ?? existing?.categoryId ?? '',
+      categoryName: payload.categoryName ?? existing?.categoryName ?? '',
+      templateId: payload.templateId ?? existing?.templateId ?? '',
+      proposalType: payload.proposalType ?? existing?.proposalType ?? '',
+      recipientName: payload.recipientName ?? existing?.recipientName ?? '',
+      recipientInstitution: payload.recipientInstitution ?? existing?.recipientInstitution ?? '',
+      recipientAddress: payload.recipientAddress ?? existing?.recipientAddress ?? '',
+      location: payload.location ?? existing?.location ?? '',
+      executionTime: payload.executionTime ?? existing?.executionTime ?? '',
+      summary: payload.summary ?? existing?.summary ?? '',
+      sections: payload.sections ?? existing?.sections ?? [],
+      attachmentIds: payload.attachmentIds ?? existing?.attachmentIds ?? [],
+      isArchived: payload.isArchived ?? existing?.isArchived ?? false,
+      archivedAt: payload.isArchived ? existing?.archivedAt || now : '',
+      status: payload.status ?? existing?.status ?? 'Draft',
+      totalBudget: linkedBudget ? linkedBudget.totalAmount : payload.totalBudget ?? existing?.totalBudget ?? 0,
+      approvedAmount: payload.approvedAmount ?? existing?.approvedAmount ?? 0,
+      receivedAmount: payload.receivedAmount ?? existing?.receivedAmount ?? 0,
+      submittedAt: payload.submittedAt ?? existing?.submittedAt ?? '',
+      approvedAt: payload.approvedAt ?? existing?.approvedAt ?? '',
+      rejectedReason: payload.rejectedReason ?? existing?.rejectedReason ?? '',
+      followUpNotes: payload.followUpNotes ?? existing?.followUpNotes ?? '',
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+      createdBy: existing?.createdBy || appUser?.uid || '',
+      updatedBy: appUser?.uid || '',
+    };
+
+    const nextProps = isEdit
+      ? proposals.map((p) => (p.id === localId ? localProposal : p))
+      : [localProposal, ...proposals];
+    setProposals(nextProps);
+    await setOfflineKV('proposals', nextProps);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{ proposal: ProposalRecord }>(
+          isEdit ? `/api/proposals/${localId}` : '/api/proposals',
+          {
+            method: isEdit ? 'PUT' : 'POST',
+            body: localProposal as unknown as Record<string, unknown>,
+          }
+        );
+        const synced = isEdit
+          ? proposals.map((p) => (p.id === res.proposal.id ? res.proposal : p))
+          : [res.proposal, ...proposals];
+        setProposals(synced);
+        await setOfflineKV('proposals', synced);
+        return { proposal: res.proposal, queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({
+      endpoint: isEdit ? `/api/proposals/${localId}` : '/api/proposals',
+      method: isEdit ? 'PUT' : 'POST',
+      body: localProposal as unknown as Record<string, unknown>,
+    });
+    await refreshQueueCount();
+    return { proposal: localProposal, queuedOffline: true };
+  };
+
+  const duplicateProposal = async (
+    id: string
+  ): Promise<{ proposal: ProposalRecord; queuedOffline: boolean }> => {
+    const src = proposals.find((p) => p.id === id);
+    if (!src) throw new Error('Proposal sumber tidak ditemukan.');
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{ proposal: ProposalRecord }>(
+          `/api/proposals/${id}/duplicate`,
+          { method: 'POST', body: {} }
+        );
+        await refreshDashboardData();
+        return { proposal: res.proposal, queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    const now = new Date().toISOString();
+    const copy: ProposalRecord = {
+      ...src,
+      id: `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      proposalNumber: '',
+      proposalDate: now.slice(0, 10),
+      title: `${src.title} (Salinan)`,
+      status: 'Draft',
+      approvedAmount: 0,
+      receivedAmount: 0,
+      submittedAt: '',
+      approvedAt: '',
+      rejectedReason: '',
+      isArchived: false,
+      archivedAt: '',
+      createdAt: now,
+      updatedAt: now,
+      createdBy: appUser?.uid || '',
+      updatedBy: appUser?.uid || '',
+    };
+    return saveProposal(copy);
+  };
+
+  const updateProposalStatus = async (
+    id: string,
+    payload: {
+      status: ProposalStatus;
+      approvedAmount?: number;
+      receivedAmount?: number;
+      notes?: string;
+    }
+  ): Promise<{ proposal: ProposalRecord; queuedOffline: boolean }> => {
+    const target = proposals.find((p) => p.id === id);
+    if (!target) throw new Error('Proposal tidak ditemukan.');
+
+    const now = new Date().toISOString();
+    const updatedLocal: ProposalRecord = {
+      ...target,
+      status: payload.status,
+      approvedAmount: payload.approvedAmount ?? target.approvedAmount ?? 0,
+      receivedAmount: payload.receivedAmount ?? target.receivedAmount ?? 0,
+      followUpNotes: payload.notes ?? target.followUpNotes,
+      submittedAt:
+        payload.status === 'Sudah diajukan' ? target.submittedAt || now : target.submittedAt,
+      approvedAt: payload.status === 'Disetujui' ? now : target.approvedAt,
+      updatedAt: now,
+      updatedBy: appUser?.uid || '',
+    };
+
+    const nextProps = proposals.map((p) => (p.id === id ? updatedLocal : p));
+    setProposals(nextProps);
+    await setOfflineKV('proposals', nextProps);
+
+    const localHist: ProposalStatusHistory = {
+      id: `hist_${Date.now()}`,
+      institutionId: 'ar-raudhah',
+      proposalId: id,
+      proposalTitle: target.title,
+      fromStatus: target.status,
+      toStatus: payload.status,
+      approvedAmount: payload.approvedAmount,
+      receivedAmount: payload.receivedAmount,
+      notes: payload.notes,
+      actorUid: appUser?.uid || '',
+      actorName: appUser?.displayName || appUser?.username || 'Pengguna',
+      createdAt: now,
+    };
+    const nextHist = [localHist, ...statusHistory];
+    setStatusHistory(nextHist);
+    await setOfflineKV('statusHistory', nextHist);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{
+          proposal: ProposalRecord;
+          historyEntry: ProposalStatusHistory;
+        }>(`/api/proposals/${id}/status`, {
+          method: 'PATCH',
+          body: payload as unknown as Record<string, unknown>,
+        });
+        const syncedProps = proposals.map((p) => (p.id === id ? res.proposal : p));
+        setProposals(syncedProps);
+        await setOfflineKV('proposals', syncedProps);
+        const syncedHist = [res.historyEntry, ...statusHistory];
+        setStatusHistory(syncedHist);
+        await setOfflineKV('statusHistory', syncedHist);
+        return { proposal: res.proposal, queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({
+      endpoint: `/api/proposals/${id}/status`,
+      method: 'PATCH',
+      body: payload as unknown as Record<string, unknown>,
+    });
+    await refreshQueueCount();
+    return { proposal: updatedLocal, queuedOffline: true };
+  };
+
+  const deleteProposal = async (id: string): Promise<{ queuedOffline: boolean }> => {
+    const nextProps = proposals.filter((p) => p.id !== id);
+    const nextBudgets = budgets.filter((b) => b.proposalId !== id);
+    setProposals(nextProps);
+    setBudgets(nextBudgets);
+    await setOfflineKV('proposals', nextProps);
+    await setOfflineKV('budgets', nextBudgets);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        await apiRequest(`/api/proposals/${id}`, { method: 'DELETE' });
+        return { queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({ endpoint: `/api/proposals/${id}`, method: 'DELETE', body: {} });
+    await refreshQueueCount();
+    return { queuedOffline: true };
+  };
+
+  const saveBudget = async (
+    payload: Partial<ProposalBudget> & { proposalId: string }
+  ): Promise<{ budget: ProposalBudget; queuedOffline: boolean }> => {
+    const now = new Date().toISOString();
+    const linkedProp = proposals.find((p) => p.id === payload.proposalId);
+    const existing = budgets.find((b) => b.proposalId === payload.proposalId);
+    const normalizedItems = (payload.items || []).map((it, idx) => {
+      const vol = Number(it.volume) || 0;
+      const price = Number(it.unitPrice) || 0;
+      return {
+        ...it,
+        order: idx + 1,
+        volume: vol,
+        unitPrice: price,
+        totalPrice: Math.round(vol * price),
+      };
+    });
+    const totalAmount = normalizedItems.reduce((sum, it) => sum + it.totalPrice, 0);
+
+    const localBudget: ProposalBudget = {
+      id: existing?.id || payload.id || `rab_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      institutionId: 'ar-raudhah',
+      proposalId: payload.proposalId,
+      proposalTitle: linkedProp?.title || payload.proposalTitle || '',
+      title: payload.title || `RAB - ${linkedProp?.title || 'Proposal'}`,
+      notes: payload.notes || '',
+      items: normalizedItems,
+      totalAmount,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+      createdBy: existing?.createdBy || appUser?.uid || '',
+      updatedBy: appUser?.uid || '',
+    };
+
+    const nextBudgets = existing
+      ? budgets.map((b) => (b.id === localBudget.id ? localBudget : b))
+      : [localBudget, ...budgets];
+    setBudgets(nextBudgets);
+    await setOfflineKV('budgets', nextBudgets);
+
+    const nextProps = proposals.map((p) =>
+      p.id === payload.proposalId ? { ...p, totalBudget: totalAmount, updatedAt: now } : p
+    );
+    setProposals(nextProps);
+    await setOfflineKV('proposals', nextProps);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{ budget: ProposalBudget }>('/api/budgets', {
+          method: 'POST',
+          body: localBudget as unknown as Record<string, unknown>,
+        });
+        const syncedBudgets = existing
+          ? budgets.map((b) => (b.id === res.budget.id ? res.budget : b))
+          : [res.budget, ...budgets];
+        setBudgets(syncedBudgets);
+        await setOfflineKV('budgets', syncedBudgets);
+        const syncedProps = proposals.map((p) =>
+          p.id === payload.proposalId ? { ...p, totalBudget: res.budget.totalAmount } : p
+        );
+        setProposals(syncedProps);
+        await setOfflineKV('proposals', syncedProps);
+        return { budget: res.budget, queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({
+      endpoint: '/api/budgets',
+      method: 'POST',
+      body: localBudget as unknown as Record<string, unknown>,
+    });
+    await refreshQueueCount();
+    return { budget: localBudget, queuedOffline: true };
+  };
+
+  const deleteBudget = async (id: string): Promise<{ queuedOffline: boolean }> => {
+    const target = budgets.find((b) => b.id === id);
+    const nextBudgets = budgets.filter((b) => b.id !== id);
+    setBudgets(nextBudgets);
+    await setOfflineKV('budgets', nextBudgets);
+    if (target) {
+      const nextProps = proposals.map((p) =>
+        p.id === target.proposalId ? { ...p, totalBudget: 0 } : p
+      );
+      setProposals(nextProps);
+      await setOfflineKV('proposals', nextProps);
+    }
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        await apiRequest(`/api/budgets/${id}`, { method: 'DELETE' });
+        return { queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({ endpoint: `/api/budgets/${id}`, method: 'DELETE', body: {} });
+    await refreshQueueCount();
+    return { queuedOffline: true };
+  };
+
+  const createAttachment = async (payload: {
+    proposalId?: string;
+    proposalTitle?: string;
+    category: ProposalAttachment['category'];
+    title: string;
+    description?: string;
+    dataUrl: string;
+    fileName: string;
+    mimeType: string;
+    fileSize: number;
+    isImage: boolean;
+  }): Promise<{ attachment: ProposalAttachment; queuedOffline: boolean }> => {
+    const now = new Date().toISOString();
+    const attId = `att_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const localAtt: ProposalAttachment = {
+      id: attId,
+      institutionId: 'ar-raudhah',
+      proposalId: payload.proposalId || '',
+      proposalTitle: payload.proposalTitle || '',
+      category: payload.category,
+      title: payload.title.trim(),
+      description: payload.description || '',
+      fileUrl: payload.dataUrl,
+      fileName: payload.fileName,
+      mimeType: payload.mimeType,
+      fileSize: payload.fileSize,
+      isImage: payload.isImage,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: appUser?.uid || '',
+    };
+
+    const nextAtts = [localAtt, ...attachments];
+    setAttachments(nextAtts);
+    await setOfflineKV('attachments', nextAtts);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{ attachment: ProposalAttachment }>('/api/attachments', {
+          method: 'POST',
+          body: {
+            id: attId,
+            proposalId: payload.proposalId || '',
+            proposalTitle: payload.proposalTitle || '',
+            category: payload.category,
+            title: payload.title.trim(),
+            description: payload.description || '',
+            dataUrl: payload.dataUrl,
+            fileName: payload.fileName,
+            mimeType: payload.mimeType,
+            fileSize: payload.fileSize,
+            isImage: payload.isImage,
+          },
+        });
+        const synced = [res.attachment, ...attachments];
+        setAttachments(synced);
+        await setOfflineKV('attachments', synced);
+        return { attachment: res.attachment, queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({
+      endpoint: '/api/attachments',
+      method: 'POST',
+      body: {
+        id: attId,
+        proposalId: payload.proposalId || '',
+        proposalTitle: payload.proposalTitle || '',
+        category: payload.category,
+        title: payload.title.trim(),
+        description: payload.description || '',
+        dataUrl: payload.dataUrl,
+        fileName: payload.fileName,
+        mimeType: payload.mimeType,
+        fileSize: payload.fileSize,
+        isImage: payload.isImage,
+      },
+    });
+    await refreshQueueCount();
+    return { attachment: localAtt, queuedOffline: true };
+  };
+
+  const deleteAttachment = async (id: string): Promise<{ queuedOffline: boolean }> => {
+    const nextAtts = attachments.filter((a) => a.id !== id);
+    setAttachments(nextAtts);
+    await setOfflineKV('attachments', nextAtts);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        await apiRequest(`/api/attachments/${id}`, { method: 'DELETE' });
+        return { queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({ endpoint: `/api/attachments/${id}`, method: 'DELETE', body: {} });
+    await refreshQueueCount();
+    return { queuedOffline: true };
+  };
+
+  const saveAppSettings = async (
+    payload: SystemAppSettings
+  ): Promise<{ queuedOffline: boolean }> => {
+    setAppSettings(payload);
+    await setOfflineKV('appSettings', payload);
+
+    if (navigator.onLine && sessionToken) {
+      try {
+        const res = await apiRequest<{ appSettings: SystemAppSettings }>('/api/settings/app', {
+          method: 'PUT',
+          body: payload as unknown as Record<string, unknown>,
+        });
+        setAppSettings(res.appSettings);
+        await setOfflineKV('appSettings', res.appSettings);
+        return { queuedOffline: false };
+      } catch (err) {
+        if (!(err instanceof TypeError) && !(err instanceof RecoverableTransportError)) {
+          throw err;
+        }
+      }
+    }
+
+    await enqueueOfflineMutation({
+      endpoint: '/api/settings/app',
+      method: 'PUT',
+      body: payload as unknown as Record<string, unknown>,
+    });
+    await refreshQueueCount();
+    return { queuedOffline: true };
+  };
+
+  const fetchAuditLogs = async (): Promise<AuditLogRecord[]> => {
+    if (!navigator.onLine || !sessionToken) {
+      return [];
+    }
+    const res = await apiRequest<{ auditLogs: AuditLogRecord[] }>('/api/audit-logs');
+    return res.auditLogs || [];
+  };
+
+  const exportBackupSnapshot = async (): Promise<Record<string, unknown>> => {
+    if (navigator.onLine && sessionToken) {
+      return apiRequest<Record<string, unknown>>('/api/backup/export');
+    }
+    return {
+      exportedAt: new Date().toISOString(),
+      institution,
+      appSettings,
+      proposalCategories: categories,
+      proposalTemplates: templates,
+      proposals,
+      proposalBudgets: budgets,
+      proposalAttachments: attachments,
+      proposalStatusHistory: statusHistory,
+    };
+  };
+
   const signOutUser = () => {
     setSessionToken(null);
     setAppUser(null);
     setInstitution(null);
     setProposals([]);
     setCategories([]);
+    setTemplates([]);
+    setBudgets([]);
+    setAttachments([]);
+    setStatusHistory([]);
     setPendingStatusUser(null);
     setIsOfflineSession(false);
     setAuthError(null);
@@ -1157,6 +1974,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         institution,
         proposals,
         categories,
+        templates,
+        budgets,
+        attachments,
+        statusHistory,
+        appSettings,
         authLoading,
         institutionLoading,
         signingIn,
@@ -1185,6 +2007,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         saveInstitution,
         updateOwnProfile,
         refreshDashboardData,
+        generateAiNarrative,
+        saveCategory,
+        deleteCategory,
+        saveTemplate,
+        duplicateTemplate,
+        deleteTemplate,
+        saveProposal,
+        duplicateProposal,
+        updateProposalStatus,
+        deleteProposal,
+        saveBudget,
+        deleteBudget,
+        createAttachment,
+        deleteAttachment,
+        saveAppSettings,
+        fetchAuditLogs,
+        exportBackupSnapshot,
       }}
     >
       {children}

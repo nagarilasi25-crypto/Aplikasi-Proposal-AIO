@@ -4,6 +4,12 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import express, { NextFunction, Request, Response } from 'express';
+import { GoogleGenAI, Type } from '@google/genai';
+import {
+  createInitialCategories,
+  createInitialTemplates,
+  DEFAULT_APP_SETTINGS,
+} from './src/lib/defaultSeeds';
 
 const PORT = Number(process.env.PORT) || 3000;
 const SESSION_SECRET =
@@ -69,8 +75,22 @@ interface StoredInstitution {
 interface StoreState {
   users: StoredUser[];
   institution: StoredInstitution;
+  categoriesSeeded?: boolean;
+  templatesSeeded?: boolean;
   proposalCategories: Array<Record<string, unknown>>;
+  proposalTemplates: Array<Record<string, unknown>>;
   proposals: Array<Record<string, unknown>>;
+  proposalBudgets: Array<Record<string, unknown>>;
+  proposalAttachments: Array<Record<string, unknown>>;
+  proposalStatusHistory: Array<Record<string, unknown>>;
+  appSettings: {
+    numberPrefix: string;
+    defaultFiscalYear: number;
+    letterCity: string;
+    paperSize: 'A4';
+    includeLogoInLetterhead: boolean;
+    footerText: string;
+  };
   auditLogs: Array<Record<string, unknown>>;
 }
 
@@ -104,39 +124,72 @@ function emptyInstitution(actorUid = ''): StoredInstitution {
   };
 }
 
+function createEmptyStoreState(): StoreState {
+  return {
+    users: [],
+    institution: emptyInstitution(),
+    categoriesSeeded: true,
+    templatesSeeded: true,
+    proposalCategories: createInitialCategories() as unknown as Array<Record<string, unknown>>,
+    proposalTemplates: createInitialTemplates('system') as unknown as Array<Record<string, unknown>>,
+    proposals: [],
+    proposalBudgets: [],
+    proposalAttachments: [],
+    proposalStatusHistory: [],
+    appSettings: { ...DEFAULT_APP_SETTINGS },
+    auditLogs: [],
+  };
+}
+
 function readStore(): StoreState {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(STORE_FILE)) {
-    const initial: StoreState = {
-      users: [],
-      institution: emptyInstitution(),
-      proposalCategories: [],
-      proposals: [],
-      auditLogs: [],
-    };
+    const initial = createEmptyStoreState();
     fs.writeFileSync(STORE_FILE, JSON.stringify(initial, null, 2), 'utf8');
     return initial;
   }
   try {
     const raw = fs.readFileSync(STORE_FILE, 'utf8');
     const parsed = JSON.parse(raw) as Partial<StoreState>;
-    return {
+
+    const categoriesRaw = Array.isArray(parsed.proposalCategories) ? parsed.proposalCategories : [];
+    const templatesRaw = Array.isArray(parsed.proposalTemplates) ? parsed.proposalTemplates : [];
+    const shouldSeedCategories = !parsed.categoriesSeeded && categoriesRaw.length === 0;
+    const shouldSeedTemplates = !parsed.templatesSeeded && templatesRaw.length === 0;
+
+    const state: StoreState = {
       users: Array.isArray(parsed.users) ? parsed.users : [],
       institution: parsed.institution || emptyInstitution(),
-      proposalCategories: Array.isArray(parsed.proposalCategories)
-        ? parsed.proposalCategories
-        : [],
+      categoriesSeeded: true,
+      templatesSeeded: true,
+      proposalCategories: shouldSeedCategories
+        ? (createInitialCategories() as unknown as Array<Record<string, unknown>>)
+        : categoriesRaw,
+      proposalTemplates: shouldSeedTemplates
+        ? (createInitialTemplates('system') as unknown as Array<Record<string, unknown>>)
+        : templatesRaw,
       proposals: Array.isArray(parsed.proposals) ? parsed.proposals : [],
+      proposalBudgets: Array.isArray(parsed.proposalBudgets) ? parsed.proposalBudgets : [],
+      proposalAttachments: Array.isArray(parsed.proposalAttachments)
+        ? parsed.proposalAttachments
+        : [],
+      proposalStatusHistory: Array.isArray(parsed.proposalStatusHistory)
+        ? parsed.proposalStatusHistory
+        : [],
+      appSettings: {
+        ...DEFAULT_APP_SETTINGS,
+        ...(parsed.appSettings || {}),
+        paperSize: 'A4',
+      },
       auditLogs: Array.isArray(parsed.auditLogs) ? parsed.auditLogs : [],
     };
+
+    if (shouldSeedCategories || shouldSeedTemplates) {
+      writeStore(state);
+    }
+    return state;
   } catch {
-    return {
-      users: [],
-      institution: emptyInstitution(),
-      proposalCategories: [],
-      proposals: [],
-      auditLogs: [],
-    };
+    return createEmptyStoreState();
   }
 }
 
@@ -222,52 +275,72 @@ function sanitizeNum(value: unknown, min = 0, max = 1000000): number {
   return Math.max(min, Math.min(max, Math.floor(num)));
 }
 
-function saveBase64ImageToUploads(
+function saveBase64AssetToUploads(
   dataUrl: string,
-  field: 'logoUrl' | 'photoUrl'
-): string {
-  const match = /^data:image\/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)$/i.exec(
-    dataUrl.trim()
-  );
+  prefix: string
+): { url: string; mimeType: string; fileSize: number; isImage: boolean } {
+  const match =
+    /^data:(image\/(png|jpeg|jpg|webp)|application\/pdf);base64,([A-Za-z0-9+/=]+)$/i.exec(
+      dataUrl.trim()
+    );
   if (!match) {
-    throw new Error('Format berkas gambar tidak didukung. Gunakan PNG, JPG, atau WebP.');
+    throw new Error('Format berkas tidak didukung. Gunakan PNG, JPG, WebP, atau PDF.');
   }
 
-  const subtype = match[1].toLowerCase();
-  const base64Body = match[2];
+  const fullMime = match[1].toLowerCase();
+  const imageSubtype = match[2]?.toLowerCase();
+  const base64Body = match[3];
   const buffer = Buffer.from(base64Body, 'base64');
 
-  if (buffer.length === 0 || buffer.length > 2 * 1024 * 1024) {
-    throw new Error('Ukuran gambar melebihi batas maksimal 2 MB.');
+  const maxSize = fullMime === 'application/pdf' ? 4 * 1024 * 1024 : 2 * 1024 * 1024;
+  if (buffer.length === 0 || buffer.length > maxSize) {
+    throw new Error(
+      fullMime === 'application/pdf'
+        ? 'Ukuran berkas PDF melebihi batas maksimal 4 MB.'
+        : 'Ukuran gambar melebihi batas maksimal 2 MB.'
+    );
   }
 
-  // Verify magic bytes for PNG, JPEG, or WebP
-  const isPng =
-    buffer.length >= 8 &&
-    buffer[0] === 0x89 &&
-    buffer[1] === 0x50 &&
-    buffer[2] === 0x4e &&
-    buffer[3] === 0x47;
-  const isJpeg =
-    buffer.length >= 3 &&
-    buffer[0] === 0xff &&
-    buffer[1] === 0xd8 &&
-    buffer[2] === 0xff;
-  const isWebp =
-    buffer.length >= 12 &&
-    buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
-    buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+  let ext = 'bin';
+  let isImage = true;
+  let canonicalMime = fullMime;
 
-  if (
-    (subtype === 'png' && !isPng) ||
-    ((subtype === 'jpeg' || subtype === 'jpg') && !isJpeg) ||
-    (subtype === 'webp' && !isWebp)
-  ) {
-    throw new Error('Isi berkas gambar tidak sesuai dengan format gambar yang dipilih.');
+  if (fullMime === 'application/pdf') {
+    const isPdf = buffer.length >= 5 && buffer.subarray(0, 5).toString('ascii') === '%PDF-';
+    if (!isPdf) {
+      throw new Error('Isi berkas bukan dokumen PDF yang valid.');
+    }
+    ext = 'pdf';
+    isImage = false;
+  } else {
+    const isPng =
+      buffer.length >= 8 &&
+      buffer[0] === 0x89 &&
+      buffer[1] === 0x50 &&
+      buffer[2] === 0x4e &&
+      buffer[3] === 0x47;
+    const isJpeg =
+      buffer.length >= 3 &&
+      buffer[0] === 0xff &&
+      buffer[1] === 0xd8 &&
+      buffer[2] === 0xff;
+    const isWebp =
+      buffer.length >= 12 &&
+      buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+
+    if (
+      (imageSubtype === 'png' && !isPng) ||
+      ((imageSubtype === 'jpeg' || imageSubtype === 'jpg') && !isJpeg) ||
+      (imageSubtype === 'webp' && !isWebp)
+    ) {
+      throw new Error('Isi berkas gambar tidak sesuai dengan format gambar yang dipilih.');
+    }
+    ext = imageSubtype === 'jpeg' || imageSubtype === 'jpg' ? 'jpg' : imageSubtype || 'png';
+    canonicalMime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
   }
 
-  const ext = subtype === 'jpeg' ? 'jpg' : subtype;
-  const safePrefix = field === 'logoUrl' ? 'logo' : 'foto';
+  const safePrefix = prefix.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 20) || 'lampiran';
   const filename = `${safePrefix}-${Date.now()}-${crypto.randomUUID()}.${ext}`;
 
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -276,7 +349,23 @@ function saveBase64ImageToUploads(
     throw new Error('Lokasi penyimpanan berkas tidak valid.');
   }
   fs.writeFileSync(targetPath, buffer);
-  return `/api/uploads/${filename}`;
+  return {
+    url: `/api/uploads/${filename}`,
+    mimeType: canonicalMime,
+    fileSize: buffer.length,
+    isImage,
+  };
+}
+
+function saveBase64ImageToUploads(
+  dataUrl: string,
+  field: 'logoUrl' | 'photoUrl'
+): string {
+  const saved = saveBase64AssetToUploads(dataUrl, field === 'logoUrl' ? 'logo' : 'foto');
+  if (!saved.isImage) {
+    throw new Error('Logo atau foto lembaga harus berupa gambar PNG, JPG, atau WebP.');
+  }
+  return saved.url;
 }
 
 function resolveInstitutionImageField(
@@ -404,7 +493,7 @@ function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '6mb' }));
+  app.use(express.json({ limit: '10mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
@@ -412,13 +501,13 @@ async function startServer() {
 
   app.get('/api/uploads/:filename', (req, res) => {
     const filename = req.params.filename || '';
-    if (!/^[a-zA-Z0-9_-]+\.(png|jpg|jpeg|webp)$/i.test(filename)) {
+    if (!/^[a-zA-Z0-9_-]+\.(png|jpg|jpeg|webp|pdf)$/i.test(filename)) {
       res.status(400).json({ error: 'Nama berkas tidak valid.' });
       return;
     }
     const targetPath = path.resolve(UPLOADS_DIR, filename);
     if (!targetPath.startsWith(UPLOADS_DIR + path.sep) || !fs.existsSync(targetPath)) {
-      res.status(404).json({ error: 'Berkas gambar tidak ditemukan.' });
+      res.status(404).json({ error: 'Berkas tidak ditemukan.' });
       return;
     }
     const ext = path.extname(filename).toLowerCase();
@@ -427,6 +516,8 @@ async function startServer() {
         ? 'image/png'
         : ext === '.webp'
         ? 'image/webp'
+        : ext === '.pdf'
+        ? 'application/pdf'
         : 'image/jpeg';
     res.setHeader('Content-Type', contentType);
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1304,14 +1395,1437 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // 8. Dashboard snapshot
+  // 8. Dashboard snapshot (full state for offline sync cache)
   app.get('/api/dashboard-data', requireAuth, (_req, res) => {
     const store = readStore();
     res.json({
       institution: store.institution,
       proposals: store.proposals,
       categories: store.proposalCategories,
+      templates: store.proposalTemplates,
+      budgets: store.proposalBudgets,
+      attachments: store.proposalAttachments,
+      statusHistory: store.proposalStatusHistory,
+      appSettings: store.appSettings,
     });
+  });
+
+  // 8a. Server-Side Gemini AI Narrative Generation
+  app.post('/api/ai/generate-narrative', requireAuth, async (req: AuthedRequest, res) => {
+    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+    if (!apiKey) {
+      res.status(503).json({
+        error: 'Kunci API Gemini (GEMINI_API_KEY) belum dikonfigurasi pada server.',
+      });
+      return;
+    }
+
+    const actor = req.currentUser!;
+    const store = readStore();
+    const body = req.body || {};
+    const target = body.target === 'proposal_section' ? 'proposal_section' : 'institution_section';
+    const userNotes = sanitizeStr(body.userNotes, 1500);
+    const instInput = (body.institution && typeof body.institution === 'object'
+      ? body.institution
+      : store.institution) as Partial<StoredInstitution>;
+
+    const institutionContextText = [
+      instInput.name ? `Nama Lembaga: ${sanitizeStr(instInput.name, 200)}` : '',
+      instInput.address ? `Alamat: ${sanitizeStr(instInput.address, 500)}` : '',
+      instInput.kecamatan ? `Kecamatan: ${sanitizeStr(instInput.kecamatan, 120)}` : '',
+      instInput.kabupaten ? `Kabupaten/Kota: ${sanitizeStr(instInput.kabupaten, 120)}` : '',
+      instInput.provinsi ? `Provinsi: ${sanitizeStr(instInput.provinsi, 120)}` : '',
+      instInput.foundedYear ? `Tahun Berdiri: ${sanitizeStr(instInput.foundedYear, 10)}` : '',
+      instInput.leaderName ? `Pimpinan Lembaga: ${sanitizeStr(instInput.leaderName, 150)}` : '',
+      instInput.statisticNumber ? `Nomor Statistik: ${sanitizeStr(instInput.statisticNumber, 100)}` : '',
+      instInput.legalityInfo ? `Legalitas: ${sanitizeStr(instInput.legalityInfo, 500)}` : '',
+      typeof instInput.studentCount === 'number' ? `Jumlah Santri: ${instInput.studentCount}` : '',
+      typeof instInput.teacherCount === 'number' ? `Jumlah Pengajar: ${instInput.teacherCount}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+    });
+
+    const generateWithResilientRetry = async (params: {
+      contents: string;
+      config: Record<string, unknown>;
+    }) => {
+      const attempts: Array<{ model: string; delayMs: number }> = [
+        { model: 'gemini-4-hydrogen', delayMs: 0 },
+        { model: 'gemini-4-hydrogen', delayMs: 800 },
+        { model: 'gemini-3.1-flash-lite', delayMs: 1200 },
+      ];
+      let lastError: unknown;
+      for (const attempt of attempts) {
+        if (attempt.delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, attempt.delayMs));
+        }
+        try {
+          return await ai.models.generateContent({
+            model: attempt.model,
+            contents: params.contents,
+            config: params.config as never,
+          });
+        } catch (err) {
+          lastError = err;
+          const msg = err instanceof Error ? err.message : String(err);
+          const isTransient =
+            msg.includes('503') ||
+            msg.includes('UNAVAILABLE') ||
+            msg.includes('high demand') ||
+            msg.includes('429');
+          if (!isTransient) {
+            throw err;
+          }
+        }
+      }
+      throw lastError;
+    };
+
+    try {
+      if (target === 'institution_section') {
+        const section = ['history', 'vision', 'mission', 'organizationStructure', 'all'].includes(
+          body.section
+        )
+          ? (body.section as 'history' | 'vision' | 'mission' | 'organizationStructure' | 'all')
+          : 'all';
+
+        const prompt = `Tugas: Susun narasi profil resmi lembaga pendidikan Al-Quran / Rumah Quran dalam bahasa Indonesia baku, resmi, sopan, dan layak dicetak dalam dokumen proposal resmi.
+
+Data Factual Lembaga yang Tersedia:
+${institutionContextText || 'Belum ada rincian identitas yang diisi; gunakan redaksi umum lembaga Rumah Quran tanpa mengarang nama/nomor legalitas palsu.'}
+
+Catatan / Arahan Tambahan Pengguna:
+${userNotes || 'Tidak ada catatan khusus; susun narasi yang rapi, terpercaya, dan menyentuh nilai pendidikan Al-Quran.'}
+
+${
+  instInput.history && section !== 'history'
+    ? `Konteks Sejarah Saat Ini: ${sanitizeStr(instInput.history, 1000)}`
+    : ''
+}
+
+Bagian yang harus dibuat: ${
+          section === 'all'
+            ? 'Keempat bagian lengkap: Sejarah Lembaga (history), Visi Lembaga (vision), Misi Lembaga (mission - format poin bernomor 1, 2, 3...), dan Struktur Organisasi (organizationStructure - susunan jabatan yang jelas, gunakan nama pimpinan bila tersedia dan penanda [Isi Nama] jika nama pengurus lain belum disebutkan).'
+            : section === 'history'
+            ? 'Hanya bagian Sejarah Lembaga (history) sebanyak 2-3 paragraf formal.'
+            : section === 'vision'
+            ? 'Hanya bagian Visi Lembaga (vision) berupa pernyataan visi yang kuat dan ringkas (1-2 kalimat) beserta uraian singkat.'
+            : section === 'mission'
+            ? 'Hanya bagian Misi Lembaga (mission) berupa 4-6 poin bernomor yang konkret dan terukur.'
+            : 'Hanya bagian Struktur Organisasi (organizationStructure) yang tersusun rapi per jabatan (Pelindung/Pembina, Pimpinan Lembaga, Sekretaris, Bendahara, Koordinator Pendidikan/Tahfidz, Bidang Sarana & Prasarana).'
+        }
+
+ATURAN KETAT:
+1. Jangan pernah mengarang nomor akta notaris, SK Kemenkumham, nomor statistik, nominal donasi palsu, atau tahun berdiri jika tidak tercantum pada Data Factual.
+2. Gunakan teks polos yang rapi tanpa tanda markdown bintang (** atau ##).`;
+
+        const properties: Record<string, { type: Type; description: string }> = {};
+        const required: string[] = [];
+        if (section === 'all' || section === 'history') {
+          properties.history = { type: Type.STRING, description: 'Narasi sejarah lembaga dalam bahasa Indonesia formal.' };
+          required.push('history');
+        }
+        if (section === 'all' || section === 'vision') {
+          properties.vision = { type: Type.STRING, description: 'Pernyataan visi lembaga dalam bahasa Indonesia formal.' };
+          required.push('vision');
+        }
+        if (section === 'all' || section === 'mission') {
+          properties.mission = { type: Type.STRING, description: 'Poin-poin misi lembaga bernomor 1, 2, 3 dst.' };
+          required.push('mission');
+        }
+        if (section === 'all' || section === 'organizationStructure') {
+          properties.organizationStructure = {
+            type: Type.STRING,
+            description: 'Susunan struktur organisasi lembaga yang rapi tanpa markdown.',
+          };
+          required.push('organizationStructure');
+        }
+
+        const response = await generateWithResilientRetry({
+          contents: prompt,
+          config: {
+            systemInstruction:
+              'Anda adalah sekretaris dan penyusun naskah proposal resmi lembaga pendidikan Islam di Indonesia. Selalu gunakan bahasa Indonesia formal EYD, jujur, tidak mengarang nomor legalitas palsu, dan tidak memakai simbol markdown.',
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties,
+              required,
+            },
+          },
+        });
+
+        const rawText = (response.text || '').trim();
+        if (!rawText) {
+          res.status(502).json({ error: 'Model AI tidak mengembalikan teks narasi.' });
+          return;
+        }
+        const parsedJson = JSON.parse(rawText) as Record<string, string>;
+
+        appendAudit(store, {
+          action: 'AI_NARRATIVE_INSTITUTION',
+          entityType: 'institutions',
+          entityId: 'ar-raudhah',
+          actorUid: actor.uid,
+          actorName: actor.displayName,
+          details: `Membuat narasi Profil Lembaga (${section}) menggunakan Gemini AI.`,
+        });
+        writeStore(store);
+
+        res.json(parsedJson);
+        return;
+      }
+
+      // target === 'proposal_section'
+      const pCtx = body.proposalContext || {};
+      const generateAll = Boolean(body.generateAllSections);
+      const existingSections: Array<{ key: string; title: string; content: string }> = Array.isArray(
+        pCtx.existingSections
+      )
+        ? pCtx.existingSections
+        : [];
+
+      const proposalFacts = [
+        pCtx.title ? `Judul Proposal: ${sanitizeStr(pCtx.title, 300)}` : '',
+        pCtx.categoryName ? `Kategori: ${sanitizeStr(pCtx.categoryName, 120)}` : '',
+        pCtx.proposalType ? `Jenis Template: ${sanitizeStr(pCtx.proposalType, 120)}` : '',
+        pCtx.recipientInstitution ? `Instansi/Donatur Tujuan: ${sanitizeStr(pCtx.recipientInstitution, 200)}` : '',
+        pCtx.recipientName ? `Penerima Surat: ${sanitizeStr(pCtx.recipientName, 150)}` : '',
+        pCtx.location ? `Lokasi Kegiatan/Pembangunan: ${sanitizeStr(pCtx.location, 250)}` : '',
+        pCtx.executionTime ? `Waktu Pelaksanaan: ${sanitizeStr(pCtx.executionTime, 150)}` : '',
+        pCtx.fiscalYear ? `Tahun Anggaran: ${Number(pCtx.fiscalYear)}` : '',
+        typeof pCtx.totalBudget === 'number' && pCtx.totalBudget > 0
+          ? `Total Kebutuhan Anggaran (RAB): Rp ${Number(pCtx.totalBudget).toLocaleString('id-ID')}`
+          : '',
+        pCtx.summary ? `Ringkasan Proposal: ${sanitizeStr(pCtx.summary, 1000)}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      if (generateAll && existingSections.length > 0) {
+        const listDesc = existingSections
+          .map((s) => `- key="${sanitizeStr(s.key, 60)}" | Judul="${sanitizeStr(s.title, 150)}"`)
+          .join('\n');
+
+        const prompt = `Susun draf isi bab proposal resmi berbahasa Indonesia baku berdasarkan data lembaga dan detail proposal berikut.
+
+Data Lembaga:
+${institutionContextText || 'Data lembaga masih minimal; gunakan penyebutan umum lembaga tanpa mengarang legalitas palsu.'}
+
+Detail Proposal:
+${proposalFacts || 'Judul/detail proposal belum lengkap; buat draf terstruktur yang relevan.'}
+
+Catatan Tambahan Pengguna:
+${userNotes || 'Tidak ada catatan tambahan.'}
+
+Daftar Bab yang Harus Disusun:
+${listDesc}
+
+ATURAN KETAT:
+1. Untuk bab profil lembaga (bila ada), manfaatkan data faktual sejarah/visi/misi/jumlah santri yang tersedia.
+2. Untuk bab anggaran (bila ada), sebutkan total anggaran hanya jika nilainya > 0; jika belum ada RAB, rujuk ke "lampiran Rencana Anggaran Biaya (RAB) terlampir".
+3. Jangan mengarang nomor surat, nomor rekening, atau nomor SK legalitas yang tidak diberikan.
+4. Gunakan teks paragraf/poin rapi tanpa markdown ** atau ##.`;
+
+        const response = await generateWithResilientRetry({
+          contents: prompt,
+          config: {
+            systemInstruction:
+              'Anda adalah penulis proposal resmi berbahasa Indonesia EYD untuk lembaga pendidikan Al-Quran. Kembalikan JSON berisi array sections sesuai key yang diminta.',
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                sections: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      key: { type: Type.STRING },
+                      content: { type: Type.STRING },
+                    },
+                    required: ['key', 'content'],
+                  },
+                },
+              },
+              required: ['sections'],
+            },
+          },
+        });
+
+        const rawText = (response.text || '').trim();
+        if (!rawText) {
+          res.status(502).json({ error: 'Model AI tidak mengembalikan draf bab proposal.' });
+          return;
+        }
+        const parsed = JSON.parse(rawText) as {
+          sections?: Array<{ key: string; content: string }>;
+        };
+        const mapObj: Record<string, string> = {};
+        for (const item of parsed.sections || []) {
+          if (item.key && typeof item.content === 'string') {
+            mapObj[item.key] = item.content.trim();
+          }
+        }
+
+        appendAudit(store, {
+          action: 'AI_NARRATIVE_PROPOSAL_ALL',
+          entityType: 'proposals',
+          entityId: sanitizeStr(pCtx.title || 'draft', 120),
+          actorUid: actor.uid,
+          actorName: actor.displayName,
+          details: `Membuat narasi seluruh bab proposal (${Object.keys(mapObj).length} bab) menggunakan Gemini AI.`,
+        });
+        writeStore(store);
+
+        res.json({ sections: mapObj });
+        return;
+      }
+
+      const sectionTitle = sanitizeStr(body.sectionTitle || 'Bab Proposal', 180);
+      const sectionKey = sanitizeStr(body.sectionKey || 'umum', 80);
+
+      const prompt = `Susun narasi resmi berbahasa Indonesia EYD untuk bagian proposal berikut:
+Bagian: ${sectionTitle} (kode: ${sectionKey})
+
+Data Lembaga:
+${institutionContextText || 'Data lembaga minimal; hindari mengarang identitas atau legalitas palsu.'}
+
+Detail Proposal:
+${proposalFacts || 'Belum ada detail khusus.'}
+
+Catatan / Arahan Tambahan Pengguna:
+${userNotes || 'Susun 2 hingga 4 paragraf yang meyakinkan, terstruktur, sopan, dan mudah dipahami donatur/instansi penerima.'}
+
+ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor akta/surat/rekening yang tidak diberikan.`;
+
+      const response = await generateWithResilientRetry({
+        contents: prompt,
+        config: {
+          systemInstruction:
+            'Anda adalah penyusun naskah proposal resmi berbahasa Indonesia EYD untuk lembaga pendidikan Islam. Tulis langsung isi bab dalam bahasa Indonesia formal tanpa judul ulang dan tanpa simbol markdown.',
+        },
+      });
+
+      const text = (response.text || '').trim();
+      if (!text) {
+        res.status(502).json({ error: 'Model AI tidak menghasilkan teks narasi.' });
+        return;
+      }
+
+      appendAudit(store, {
+        action: 'AI_NARRATIVE_PROPOSAL_SECTION',
+        entityType: 'proposals',
+        entityId: sectionKey,
+        actorUid: actor.uid,
+        actorName: actor.displayName,
+        details: `Membuat narasi bab "${sectionTitle}" menggunakan Gemini AI.`,
+      });
+      writeStore(store);
+
+      res.json({ text });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal menghubungi layanan Gemini AI.';
+      res.status(502).json({ error: `Gagal membuat narasi AI: ${msg}` });
+    }
+  });
+
+  // 8b. Proposal Categories CRUD
+  app.get('/api/categories', requireAuth, (_req, res) => {
+    const store = readStore();
+    res.json({ categories: store.proposalCategories });
+  });
+
+  app.post('/api/categories', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan mengubah kategori proposal.' });
+      return;
+    }
+    const name = sanitizeStr(req.body?.name, 120);
+    if (!name) {
+      res.status(400).json({ error: 'Nama kategori wajib diisi.' });
+      return;
+    }
+    const code = sanitizeStr(req.body?.code, 12).toUpperCase();
+    const description = sanitizeStr(req.body?.description, 500);
+    const store = readStore();
+    const duplicate = store.proposalCategories.some(
+      (c) => String(c.name || '').trim().toLowerCase() === name.toLowerCase()
+    );
+    if (duplicate) {
+      res.status(409).json({ error: 'Nama kategori tersebut sudah ada.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const category = {
+      id: sanitizeStr(req.body?.id, 80) || `cat_${crypto.randomUUID()}`,
+      institutionId: 'ar-raudhah',
+      name,
+      code: code || name.slice(0, 3).toUpperCase(),
+      description,
+      isActive: req.body?.isActive !== false,
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.proposalCategories.push(category);
+    appendAudit(store, {
+      action: 'CATEGORY_CREATE',
+      entityType: 'proposalCategories',
+      entityId: category.id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Menambahkan kategori proposal: ${name}.`,
+    });
+    writeStore(store);
+    res.status(201).json({ category });
+  });
+
+  app.put('/api/categories/:id', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan mengubah kategori proposal.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const idx = store.proposalCategories.findIndex((c) => c.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Kategori tidak ditemukan.' });
+      return;
+    }
+    const name = sanitizeStr(req.body?.name, 120);
+    if (!name) {
+      res.status(400).json({ error: 'Nama kategori wajib diisi.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    const updated = {
+      ...store.proposalCategories[idx],
+      name,
+      code: sanitizeStr(req.body?.code, 12).toUpperCase() || String(store.proposalCategories[idx].code || ''),
+      description: sanitizeStr(req.body?.description, 500),
+      isActive: typeof req.body?.isActive === 'boolean' ? req.body.isActive : Boolean(store.proposalCategories[idx].isActive),
+      updatedAt: now,
+    };
+    store.proposalCategories[idx] = updated;
+    appendAudit(store, {
+      action: 'CATEGORY_UPDATE',
+      entityType: 'proposalCategories',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Memperbarui kategori proposal: ${name}.`,
+    });
+    writeStore(store);
+    res.json({ category: updated });
+  });
+
+  app.delete('/api/categories/:id', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator') {
+      res.status(403).json({ error: 'Hanya Administrator yang dapat menghapus kategori.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const idx = store.proposalCategories.findIndex((c) => c.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Kategori tidak ditemukan.' });
+      return;
+    }
+    const [removed] = store.proposalCategories.splice(idx, 1);
+    appendAudit(store, {
+      action: 'CATEGORY_DELETE',
+      entityType: 'proposalCategories',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Menghapus kategori proposal: ${String(removed.name || id)}.`,
+    });
+    writeStore(store);
+    res.json({ ok: true });
+  });
+
+  // 8c. Master Proposal Templates CRUD
+  app.get('/api/templates', requireAuth, (_req, res) => {
+    const store = readStore();
+    res.json({ templates: store.proposalTemplates });
+  });
+
+  app.post('/api/templates', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan membuat template.' });
+      return;
+    }
+    const name = sanitizeStr(req.body?.name, 160);
+    if (!name) {
+      res.status(400).json({ error: 'Nama template wajib diisi.' });
+      return;
+    }
+    const rawSections = Array.isArray(req.body?.sections) ? req.body.sections : [];
+    const sections = rawSections.map((sec: Record<string, unknown>, i: number) => ({
+      id: sanitizeStr(sec.id, 80) || `sec_${crypto.randomUUID()}`,
+      key: sanitizeStr(sec.key, 60) || `bab_${i + 1}`,
+      title: sanitizeStr(sec.title, 180) || `Bab ${i + 1}`,
+      description: sanitizeStr(sec.description, 500),
+      defaultContent: sanitizeStr(sec.defaultContent, 8000),
+      order: i + 1,
+      enabled: sec.enabled !== false,
+      required: Boolean(sec.required),
+    }));
+
+    const now = new Date().toISOString();
+    const template = {
+      id: sanitizeStr(req.body?.id, 80) || `tpl_${crypto.randomUUID()}`,
+      institutionId: 'ar-raudhah',
+      name,
+      proposalType: sanitizeStr(req.body?.proposalType, 100) || 'Umum',
+      description: sanitizeStr(req.body?.description, 600),
+      sections,
+      isDefault: Boolean(req.body?.isDefault),
+      isActive: req.body?.isActive !== false,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: actor.uid,
+      updatedBy: actor.uid,
+    };
+
+    const store = readStore();
+    store.proposalTemplates.push(template);
+    appendAudit(store, {
+      action: 'TEMPLATE_CREATE',
+      entityType: 'proposalTemplates',
+      entityId: template.id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Membuat template proposal: ${name}.`,
+    });
+    writeStore(store);
+    res.status(201).json({ template });
+  });
+
+  app.put('/api/templates/:id', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan mengubah template.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const idx = store.proposalTemplates.findIndex((t) => t.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Template tidak ditemukan.' });
+      return;
+    }
+    const name = sanitizeStr(req.body?.name, 160);
+    if (!name) {
+      res.status(400).json({ error: 'Nama template wajib diisi.' });
+      return;
+    }
+    const rawSections = Array.isArray(req.body?.sections)
+      ? req.body.sections
+      : (store.proposalTemplates[idx].sections as Array<Record<string, unknown>>) || [];
+    const sections = rawSections.map((sec: Record<string, unknown>, i: number) => ({
+      id: sanitizeStr(sec.id, 80) || `sec_${crypto.randomUUID()}`,
+      key: sanitizeStr(sec.key, 60) || `bab_${i + 1}`,
+      title: sanitizeStr(sec.title, 180) || `Bab ${i + 1}`,
+      description: sanitizeStr(sec.description, 500),
+      defaultContent: sanitizeStr(sec.defaultContent, 8000),
+      order: i + 1,
+      enabled: sec.enabled !== false,
+      required: Boolean(sec.required),
+    }));
+
+    const now = new Date().toISOString();
+    const updated = {
+      ...store.proposalTemplates[idx],
+      name,
+      proposalType: sanitizeStr(req.body?.proposalType, 100) || String(store.proposalTemplates[idx].proposalType || 'Umum'),
+      description: sanitizeStr(req.body?.description, 600),
+      sections,
+      isActive: typeof req.body?.isActive === 'boolean' ? req.body.isActive : Boolean(store.proposalTemplates[idx].isActive),
+      updatedAt: now,
+      updatedBy: actor.uid,
+    };
+    store.proposalTemplates[idx] = updated;
+    appendAudit(store, {
+      action: 'TEMPLATE_UPDATE',
+      entityType: 'proposalTemplates',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Memperbarui template proposal: ${name}.`,
+    });
+    writeStore(store);
+    res.json({ template: updated });
+  });
+
+  app.post('/api/templates/:id/duplicate', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan menduplikasi template.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const src = store.proposalTemplates.find((t) => t.id === id);
+    if (!src) {
+      res.status(404).json({ error: 'Template sumber tidak ditemukan.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    const copy = {
+      ...src,
+      id: `tpl_${crypto.randomUUID()}`,
+      name: `${String(src.name)} (Salinan)`,
+      isDefault: false,
+      sections: Array.isArray(src.sections)
+        ? src.sections.map((s) => ({ ...(s as Record<string, unknown>) }))
+        : [],
+      createdAt: now,
+      updatedAt: now,
+      createdBy: actor.uid,
+      updatedBy: actor.uid,
+    };
+    store.proposalTemplates.push(copy);
+    appendAudit(store, {
+      action: 'TEMPLATE_DUPLICATE',
+      entityType: 'proposalTemplates',
+      entityId: copy.id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Menduplikasi template ${String(src.name)} menjadi ${copy.name}.`,
+    });
+    writeStore(store);
+    res.status(201).json({ template: copy });
+  });
+
+  app.delete('/api/templates/:id', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator') {
+      res.status(403).json({ error: 'Hanya Administrator yang dapat menghapus template.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const idx = store.proposalTemplates.findIndex((t) => t.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Template tidak ditemukan.' });
+      return;
+    }
+    const [removed] = store.proposalTemplates.splice(idx, 1);
+    appendAudit(store, {
+      action: 'TEMPLATE_DELETE',
+      entityType: 'proposalTemplates',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Menghapus template proposal: ${String(removed.name || id)}.`,
+    });
+    writeStore(store);
+    res.json({ ok: true });
+  });
+
+  // 8d. Proposals CRUD & Workflow
+  const VALID_PROPOSAL_STATUSES = [
+    'Draft',
+    'Menunggu persetujuan',
+    'Siap diajukan',
+    'Sudah diajukan',
+    'Dalam proses',
+    'Disetujui',
+    'Ditolak',
+    'Bantuan diterima',
+    'Selesai',
+  ];
+
+  app.get('/api/proposals', requireAuth, (_req, res) => {
+    const store = readStore();
+    res.json({ proposals: store.proposals });
+  });
+
+  app.post('/api/proposals', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan membuat proposal baru.' });
+      return;
+    }
+    const body = req.body || {};
+    const title = sanitizeStr(body.title, 300);
+    if (!title) {
+      res.status(400).json({ error: 'Judul proposal wajib diisi.' });
+      return;
+    }
+
+    const store = readStore();
+    const now = new Date().toISOString();
+    const proposalId = sanitizeStr(body.id, 80) || `prop_${crypto.randomUUID()}`;
+    const rawSections = Array.isArray(body.sections) ? body.sections : [];
+    const sections = rawSections.map((sec: Record<string, unknown>, i: number) => ({
+      id: sanitizeStr(sec.id, 80) || `sec_${i + 1}`,
+      key: sanitizeStr(sec.key, 60) || `bab_${i + 1}`,
+      title: sanitizeStr(sec.title, 180) || `Bab ${i + 1}`,
+      description: sanitizeStr(sec.description, 500),
+      content: typeof sec.content === 'string' ? sec.content.trim().slice(0, 20000) : '',
+      enabled: sec.enabled !== false,
+      order: i + 1,
+    }));
+
+    const status = VALID_PROPOSAL_STATUSES.includes(body.status) ? body.status : 'Draft';
+    const linkedBudget = store.proposalBudgets.find((b) => b.proposalId === proposalId);
+    const totalBudget = linkedBudget
+      ? Number(linkedBudget.totalAmount) || 0
+      : sanitizeNum(body.totalBudget, 0, 100_000_000_000);
+
+    const proposal = {
+      id: proposalId,
+      institutionId: 'ar-raudhah',
+      proposalNumber: sanitizeStr(body.proposalNumber, 120),
+      proposalDate: sanitizeStr(body.proposalDate, 30) || now.slice(0, 10),
+      fiscalYear: sanitizeNum(body.fiscalYear, 2000, 2100) || store.appSettings.defaultFiscalYear,
+      title,
+      categoryId: sanitizeStr(body.categoryId, 80),
+      categoryName: sanitizeStr(body.categoryName, 120),
+      templateId: sanitizeStr(body.templateId, 80),
+      proposalType: sanitizeStr(body.proposalType, 120),
+      recipientName: sanitizeStr(body.recipientName, 150),
+      recipientInstitution: sanitizeStr(body.recipientInstitution, 200),
+      recipientAddress: sanitizeStr(body.recipientAddress, 400),
+      location: sanitizeStr(body.location, 250),
+      executionTime: sanitizeStr(body.executionTime, 150),
+      summary: sanitizeStr(body.summary, 2000),
+      sections,
+      attachmentIds: Array.isArray(body.attachmentIds)
+        ? body.attachmentIds.map((v: unknown) => sanitizeStr(v, 80)).filter(Boolean)
+        : [],
+      isArchived: Boolean(body.isArchived),
+      archivedAt: body.isArchived ? now : '',
+      status,
+      totalBudget,
+      approvedAmount: sanitizeNum(body.approvedAmount, 0, 100_000_000_000),
+      receivedAmount: sanitizeNum(body.receivedAmount, 0, 100_000_000_000),
+      submittedAt: sanitizeStr(body.submittedAt, 40),
+      approvedAt: sanitizeStr(body.approvedAt, 40),
+      rejectedReason: sanitizeStr(body.rejectedReason, 1000),
+      followUpNotes: sanitizeStr(body.followUpNotes, 2000),
+      createdAt: now,
+      updatedAt: now,
+      createdBy: actor.uid,
+      updatedBy: actor.uid,
+    };
+
+    store.proposals.unshift(proposal);
+    store.proposalStatusHistory.unshift({
+      id: `hist_${crypto.randomUUID()}`,
+      institutionId: 'ar-raudhah',
+      proposalId,
+      proposalTitle: title,
+      toStatus: status,
+      notes: 'Proposal dibuat.',
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      createdAt: now,
+    });
+    appendAudit(store, {
+      action: 'PROPOSAL_CREATE',
+      entityType: 'proposals',
+      entityId: proposalId,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Membuat proposal "${title}" (${status}).`,
+    });
+    writeStore(store);
+    res.status(201).json({ proposal });
+  });
+
+  app.put('/api/proposals/:id', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan menyunting proposal.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const idx = store.proposals.findIndex((p) => p.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Proposal tidak ditemukan.' });
+      return;
+    }
+    const existing = store.proposals[idx];
+    const body = req.body || {};
+    const title = sanitizeStr(body.title, 300) || String(existing.title || '');
+    if (!title) {
+      res.status(400).json({ error: 'Judul proposal wajib diisi.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const rawSections = Array.isArray(body.sections)
+      ? body.sections
+      : Array.isArray(existing.sections)
+      ? existing.sections
+      : [];
+    const sections = rawSections.map((sec: Record<string, unknown>, i: number) => ({
+      id: sanitizeStr(sec.id, 80) || `sec_${i + 1}`,
+      key: sanitizeStr(sec.key, 60) || `bab_${i + 1}`,
+      title: sanitizeStr(sec.title, 180) || `Bab ${i + 1}`,
+      description: sanitizeStr(sec.description, 500),
+      content: typeof sec.content === 'string' ? sec.content.trim().slice(0, 20000) : '',
+      enabled: sec.enabled !== false,
+      order: i + 1,
+    }));
+
+    const linkedBudget = store.proposalBudgets.find((b) => b.proposalId === id);
+    const totalBudget = linkedBudget
+      ? Number(linkedBudget.totalAmount) || 0
+      : typeof body.totalBudget === 'number'
+      ? sanitizeNum(body.totalBudget, 0, 100_000_000_000)
+      : Number(existing.totalBudget) || 0;
+
+    const nextArchived =
+      typeof body.isArchived === 'boolean' ? body.isArchived : Boolean(existing.isArchived);
+
+    const updated = {
+      ...existing,
+      proposalNumber: body.proposalNumber !== undefined ? sanitizeStr(body.proposalNumber, 120) : existing.proposalNumber,
+      proposalDate: body.proposalDate !== undefined ? sanitizeStr(body.proposalDate, 30) : existing.proposalDate,
+      fiscalYear: body.fiscalYear !== undefined ? sanitizeNum(body.fiscalYear, 2000, 2100) : existing.fiscalYear,
+      title,
+      categoryId: body.categoryId !== undefined ? sanitizeStr(body.categoryId, 80) : existing.categoryId,
+      categoryName: body.categoryName !== undefined ? sanitizeStr(body.categoryName, 120) : existing.categoryName,
+      templateId: body.templateId !== undefined ? sanitizeStr(body.templateId, 80) : existing.templateId,
+      proposalType: body.proposalType !== undefined ? sanitizeStr(body.proposalType, 120) : existing.proposalType,
+      recipientName: body.recipientName !== undefined ? sanitizeStr(body.recipientName, 150) : existing.recipientName,
+      recipientInstitution:
+        body.recipientInstitution !== undefined
+          ? sanitizeStr(body.recipientInstitution, 200)
+          : existing.recipientInstitution,
+      recipientAddress:
+        body.recipientAddress !== undefined
+          ? sanitizeStr(body.recipientAddress, 400)
+          : existing.recipientAddress,
+      location: body.location !== undefined ? sanitizeStr(body.location, 250) : existing.location,
+      executionTime:
+        body.executionTime !== undefined ? sanitizeStr(body.executionTime, 150) : existing.executionTime,
+      summary: body.summary !== undefined ? sanitizeStr(body.summary, 2000) : existing.summary,
+      sections,
+      attachmentIds: Array.isArray(body.attachmentIds)
+        ? body.attachmentIds.map((v: unknown) => sanitizeStr(v, 80)).filter(Boolean)
+        : existing.attachmentIds || [],
+      isArchived: nextArchived,
+      archivedAt: nextArchived ? existing.archivedAt || now : '',
+      totalBudget,
+      followUpNotes:
+        body.followUpNotes !== undefined ? sanitizeStr(body.followUpNotes, 2000) : existing.followUpNotes,
+      updatedAt: now,
+      updatedBy: actor.uid,
+    };
+
+    store.proposals[idx] = updated;
+    appendAudit(store, {
+      action: 'PROPOSAL_UPDATE',
+      entityType: 'proposals',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Memperbarui proposal "${title}".`,
+    });
+    writeStore(store);
+    res.json({ proposal: updated });
+  });
+
+  app.post('/api/proposals/:id/duplicate', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan menduplikasi proposal.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const src = store.proposals.find((p) => p.id === id);
+    if (!src) {
+      res.status(404).json({ error: 'Proposal sumber tidak ditemukan.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    const newId = `prop_${crypto.randomUUID()}`;
+    const copy = {
+      ...src,
+      id: newId,
+      proposalNumber: '',
+      proposalDate: now.slice(0, 10),
+      title: `${String(src.title)} (Salinan)`,
+      status: 'Draft',
+      approvedAmount: 0,
+      receivedAmount: 0,
+      submittedAt: '',
+      approvedAt: '',
+      rejectedReason: '',
+      isArchived: false,
+      archivedAt: '',
+      sections: Array.isArray(src.sections)
+        ? src.sections.map((s) => ({ ...(s as Record<string, unknown>) }))
+        : [],
+      createdAt: now,
+      updatedAt: now,
+      createdBy: actor.uid,
+      updatedBy: actor.uid,
+    };
+    store.proposals.unshift(copy);
+
+    // Also duplicate linked RAB budget if present
+    const srcBudget = store.proposalBudgets.find((b) => b.proposalId === id);
+    if (srcBudget) {
+      const budgetCopy = {
+        ...srcBudget,
+        id: `rab_${crypto.randomUUID()}`,
+        proposalId: newId,
+        proposalTitle: copy.title,
+        items: Array.isArray(srcBudget.items)
+          ? srcBudget.items.map((it) => ({ ...(it as Record<string, unknown>), id: `item_${crypto.randomUUID()}` }))
+          : [],
+        createdAt: now,
+        updatedAt: now,
+        createdBy: actor.uid,
+        updatedBy: actor.uid,
+      };
+      store.proposalBudgets.push(budgetCopy);
+    }
+
+    store.proposalStatusHistory.unshift({
+      id: `hist_${crypto.randomUUID()}`,
+      institutionId: 'ar-raudhah',
+      proposalId: newId,
+      proposalTitle: copy.title,
+      toStatus: 'Draft',
+      notes: `Diduplikasi dari proposal "${String(src.title)}".`,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      createdAt: now,
+    });
+    appendAudit(store, {
+      action: 'PROPOSAL_DUPLICATE',
+      entityType: 'proposals',
+      entityId: newId,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Menduplikasi proposal "${String(src.title)}".`,
+    });
+    writeStore(store);
+    res.status(201).json({ proposal: copy });
+  });
+
+  app.patch('/api/proposals/:id/status', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    const id = req.params.id;
+    const toStatus = req.body?.status;
+    if (!VALID_PROPOSAL_STATUSES.includes(toStatus)) {
+      res.status(400).json({ error: 'Status proposal tidak valid.' });
+      return;
+    }
+
+    const leaderOnlyStatuses = ['Disetujui', 'Ditolak', 'Bantuan diterima', 'Selesai'];
+    if (
+      leaderOnlyStatuses.includes(toStatus) &&
+      actor.role !== 'Administrator' &&
+      actor.role !== 'Pimpinan'
+    ) {
+      res.status(403).json({
+        error: `Status "${toStatus}" hanya dapat ditetapkan oleh Pimpinan atau Administrator.`,
+      });
+      return;
+    }
+
+    const store = readStore();
+    const idx = store.proposals.findIndex((p) => p.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Proposal tidak ditemukan.' });
+      return;
+    }
+
+    const existing = store.proposals[idx];
+    const fromStatus = String(existing.status || 'Draft');
+    const now = new Date().toISOString();
+
+    const approvedAmount =
+      req.body?.approvedAmount !== undefined
+        ? sanitizeNum(req.body.approvedAmount, 0, 100_000_000_000)
+        : Number(existing.approvedAmount) || 0;
+    const receivedAmount =
+      req.body?.receivedAmount !== undefined
+        ? sanitizeNum(req.body.receivedAmount, 0, 100_000_000_000)
+        : Number(existing.receivedAmount) || 0;
+    const notes = sanitizeStr(req.body?.notes, 2000);
+
+    const updated = {
+      ...existing,
+      status: toStatus,
+      approvedAmount,
+      receivedAmount,
+      submittedAt:
+        toStatus === 'Sudah diajukan' ? existing.submittedAt || now : existing.submittedAt,
+      approvedAt: toStatus === 'Disetujui' ? now : existing.approvedAt,
+      rejectedReason: toStatus === 'Ditolak' ? notes || existing.rejectedReason : existing.rejectedReason,
+      followUpNotes: notes || existing.followUpNotes,
+      updatedAt: now,
+      updatedBy: actor.uid,
+    };
+    store.proposals[idx] = updated;
+
+    const historyEntry = {
+      id: `hist_${crypto.randomUUID()}`,
+      institutionId: 'ar-raudhah',
+      proposalId: id,
+      proposalTitle: String(existing.title || ''),
+      fromStatus,
+      toStatus,
+      approvedAmount,
+      receivedAmount,
+      notes,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      createdAt: now,
+    };
+    store.proposalStatusHistory.unshift(historyEntry);
+
+    appendAudit(store, {
+      action: 'PROPOSAL_STATUS_CHANGE',
+      entityType: 'proposals',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Mengubah status "${String(existing.title)}" dari ${fromStatus} menjadi ${toStatus}.`,
+    });
+    writeStore(store);
+    res.json({ proposal: updated, historyEntry });
+  });
+
+  app.delete('/api/proposals/:id', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    const id = req.params.id;
+    const store = readStore();
+    const idx = store.proposals.findIndex((p) => p.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Proposal tidak ditemukan.' });
+      return;
+    }
+    const target = store.proposals[idx];
+    if (actor.role !== 'Administrator' && target.createdBy !== actor.uid) {
+      res.status(403).json({
+        error: 'Hanya Administrator atau pembuat proposal yang dapat menghapus proposal ini.',
+      });
+      return;
+    }
+    const [removed] = store.proposals.splice(idx, 1);
+    store.proposalBudgets = store.proposalBudgets.filter((b) => b.proposalId !== id);
+    store.proposalStatusHistory = store.proposalStatusHistory.filter((h) => h.proposalId !== id);
+
+    appendAudit(store, {
+      action: 'PROPOSAL_DELETE',
+      entityType: 'proposals',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Menghapus proposal "${String(removed.title || id)}".`,
+    });
+    writeStore(store);
+    res.json({ ok: true });
+  });
+
+  // 8e. RAB / Proposal Budgets CRUD (Server-authoritative math & proposal.totalBudget sync)
+  app.get('/api/budgets', requireAuth, (_req, res) => {
+    const store = readStore();
+    res.json({ budgets: store.proposalBudgets });
+  });
+
+  function normalizeRabItems(rawItems: unknown): { items: Array<Record<string, unknown>>; totalAmount: number } {
+    const arr = Array.isArray(rawItems) ? rawItems : [];
+    let totalAmount = 0;
+    const items = arr.map((item: Record<string, unknown>, idx: number) => {
+      const volumeNum = Number(item.volume);
+      const unitPriceNum = Number(item.unitPrice);
+      const volume = Number.isFinite(volumeNum) && volumeNum >= 0 ? Math.min(1_000_000, volumeNum) : 0;
+      const unitPrice =
+        Number.isFinite(unitPriceNum) && unitPriceNum >= 0
+          ? Math.min(100_000_000_000, unitPriceNum)
+          : 0;
+      const totalPrice = Math.round(volume * unitPrice);
+      totalAmount += totalPrice;
+      return {
+        id: sanitizeStr(item.id, 80) || `item_${crypto.randomUUID()}`,
+        groupName: sanitizeStr(item.groupName, 140) || 'Pekerjaan Umum',
+        order: idx + 1,
+        description: sanitizeStr(item.description, 300),
+        volume,
+        unit: sanitizeStr(item.unit, 40) || 'Unit',
+        unitPrice,
+        totalPrice,
+      };
+    });
+    return { items, totalAmount };
+  }
+
+  app.post('/api/budgets', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan menyusun RAB.' });
+      return;
+    }
+    const body = req.body || {};
+    const proposalId = sanitizeStr(body.proposalId, 80);
+    if (!proposalId) {
+      res.status(400).json({ error: 'RAB harus dihubungkan ke salah satu proposal.' });
+      return;
+    }
+
+    const store = readStore();
+    const { items, totalAmount } = normalizeRabItems(body.items);
+    const linkedProposalIdx = store.proposals.findIndex((p) => p.id === proposalId);
+    const proposalTitle =
+      linkedProposalIdx !== -1
+        ? String(store.proposals[linkedProposalIdx].title || '')
+        : sanitizeStr(body.proposalTitle, 300);
+
+    const now = new Date().toISOString();
+    const existingIdx = store.proposalBudgets.findIndex((b) => b.proposalId === proposalId);
+
+    const budgetRecord = {
+      id:
+        existingIdx !== -1
+          ? String(store.proposalBudgets[existingIdx].id)
+          : sanitizeStr(body.id, 80) || `rab_${crypto.randomUUID()}`,
+      institutionId: 'ar-raudhah',
+      proposalId,
+      proposalTitle,
+      title: sanitizeStr(body.title, 200) || `RAB - ${proposalTitle || 'Proposal'}`,
+      notes: sanitizeStr(body.notes, 1000),
+      items,
+      totalAmount,
+      createdAt:
+        existingIdx !== -1 ? String(store.proposalBudgets[existingIdx].createdAt || now) : now,
+      updatedAt: now,
+      createdBy:
+        existingIdx !== -1
+          ? String(store.proposalBudgets[existingIdx].createdBy || actor.uid)
+          : actor.uid,
+      updatedBy: actor.uid,
+    };
+
+    if (existingIdx !== -1) {
+      store.proposalBudgets[existingIdx] = budgetRecord;
+    } else {
+      store.proposalBudgets.unshift(budgetRecord);
+    }
+
+    if (linkedProposalIdx !== -1) {
+      store.proposals[linkedProposalIdx] = {
+        ...store.proposals[linkedProposalIdx],
+        totalBudget: totalAmount,
+        updatedAt: now,
+        updatedBy: actor.uid,
+      };
+    }
+
+    appendAudit(store, {
+      action: 'BUDGET_SAVE',
+      entityType: 'proposalBudgets',
+      entityId: budgetRecord.id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Menyimpan RAB "${budgetRecord.title}" total Rp ${totalAmount.toLocaleString('id-ID')}.`,
+    });
+    writeStore(store);
+    res.status(existingIdx !== -1 ? 200 : 201).json({ budget: budgetRecord });
+  });
+
+  app.put('/api/budgets/:id', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan mengubah RAB.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const idx = store.proposalBudgets.findIndex((b) => b.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Data RAB tidak ditemukan.' });
+      return;
+    }
+    const existing = store.proposalBudgets[idx];
+    const body = req.body || {};
+    const proposalId = sanitizeStr(body.proposalId, 80) || String(existing.proposalId || '');
+    const { items, totalAmount } = normalizeRabItems(body.items);
+    const linkedProposalIdx = store.proposals.findIndex((p) => p.id === proposalId);
+    const now = new Date().toISOString();
+
+    const updated = {
+      ...existing,
+      proposalId,
+      proposalTitle:
+        linkedProposalIdx !== -1
+          ? String(store.proposals[linkedProposalIdx].title || '')
+          : String(existing.proposalTitle || ''),
+      title: sanitizeStr(body.title, 200) || String(existing.title || ''),
+      notes: sanitizeStr(body.notes, 1000),
+      items,
+      totalAmount,
+      updatedAt: now,
+      updatedBy: actor.uid,
+    };
+    store.proposalBudgets[idx] = updated;
+
+    if (linkedProposalIdx !== -1) {
+      store.proposals[linkedProposalIdx] = {
+        ...store.proposals[linkedProposalIdx],
+        totalBudget: totalAmount,
+        updatedAt: now,
+        updatedBy: actor.uid,
+      };
+    }
+
+    appendAudit(store, {
+      action: 'BUDGET_UPDATE',
+      entityType: 'proposalBudgets',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Memperbarui RAB "${updated.title}" total Rp ${totalAmount.toLocaleString('id-ID')}.`,
+    });
+    writeStore(store);
+    res.json({ budget: updated });
+  });
+
+  app.delete('/api/budgets/:id', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan menghapus RAB.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const idx = store.proposalBudgets.findIndex((b) => b.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Data RAB tidak ditemukan.' });
+      return;
+    }
+    const [removed] = store.proposalBudgets.splice(idx, 1);
+    const linkedIdx = store.proposals.findIndex((p) => p.id === removed.proposalId);
+    if (linkedIdx !== -1) {
+      store.proposals[linkedIdx] = {
+        ...store.proposals[linkedIdx],
+        totalBudget: 0,
+        updatedAt: new Date().toISOString(),
+        updatedBy: actor.uid,
+      };
+    }
+    appendAudit(store, {
+      action: 'BUDGET_DELETE',
+      entityType: 'proposalBudgets',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Menghapus RAB "${String(removed.title || id)}".`,
+    });
+    writeStore(store);
+    res.json({ ok: true });
+  });
+
+  // 8f. Attachments & Documentation Upload CRUD
+  app.get('/api/attachments', requireAuth, (_req, res) => {
+    const store = readStore();
+    res.json({ attachments: store.proposalAttachments });
+  });
+
+  app.post('/api/attachments', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan mengunggah lampiran.' });
+      return;
+    }
+    const body = req.body || {};
+    const title = sanitizeStr(body.title, 200);
+    if (!title) {
+      res.status(400).json({ error: 'Judul lampiran wajib diisi.' });
+      return;
+    }
+    const dataUrl = typeof body.dataUrl === 'string' ? body.dataUrl : '';
+    const rawFileUrl = typeof body.fileUrl === 'string' ? body.fileUrl : '';
+    let fileUrl = rawFileUrl;
+    let mimeType = sanitizeStr(body.mimeType, 100) || 'image/jpeg';
+    let fileSize = sanitizeNum(body.fileSize, 0, 20_000_000);
+    let isImage = Boolean(body.isImage ?? true);
+
+    try {
+      const sourceData = dataUrl || (rawFileUrl.startsWith('data:') ? rawFileUrl : '');
+      if (sourceData) {
+        const saved = saveBase64AssetToUploads(sourceData, 'dok');
+        fileUrl = saved.url;
+        mimeType = saved.mimeType;
+        fileSize = saved.fileSize;
+        isImage = saved.isImage;
+      } else if (!rawFileUrl.startsWith('/api/uploads/')) {
+        res.status(400).json({ error: 'Berkas lampiran wajib diunggah.' });
+        return;
+      }
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Gagal menyimpan berkas lampiran.',
+      });
+      return;
+    }
+
+    const store = readStore();
+    const proposalId = sanitizeStr(body.proposalId, 80);
+    const linkedProp = proposalId ? store.proposals.find((p) => p.id === proposalId) : undefined;
+    const now = new Date().toISOString();
+    const attId = sanitizeStr(body.id, 80) || `att_${crypto.randomUUID()}`;
+
+    const attachment = {
+      id: attId,
+      institutionId: 'ar-raudhah',
+      proposalId,
+      proposalTitle: linkedProp ? String(linkedProp.title || '') : sanitizeStr(body.proposalTitle, 300),
+      category: sanitizeStr(body.category, 80) || 'Lainnya',
+      title,
+      description: sanitizeStr(body.description, 500),
+      fileUrl,
+      fileName: sanitizeStr(body.fileName, 200) || `${attId}.${isImage ? 'jpg' : 'pdf'}`,
+      mimeType,
+      fileSize,
+      isImage,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: actor.uid,
+    };
+
+    store.proposalAttachments.unshift(attachment);
+    if (linkedProp) {
+      const existingIds = Array.isArray(linkedProp.attachmentIds)
+        ? (linkedProp.attachmentIds as string[])
+        : [];
+      if (!existingIds.includes(attId)) {
+        linkedProp.attachmentIds = [...existingIds, attId];
+      }
+    }
+
+    appendAudit(store, {
+      action: 'ATTACHMENT_CREATE',
+      entityType: 'proposalAttachments',
+      entityId: attId,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Mengunggah lampiran "${title}" (${attachment.category}).`,
+    });
+    writeStore(store);
+    res.status(201).json({ attachment });
+  });
+
+  app.delete('/api/attachments/:id', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan menghapus lampiran.' });
+      return;
+    }
+    const id = req.params.id;
+    const store = readStore();
+    const idx = store.proposalAttachments.findIndex((a) => a.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Lampiran tidak ditemukan.' });
+      return;
+    }
+    const [removed] = store.proposalAttachments.splice(idx, 1);
+
+    // Clean up attachmentIds reference in proposals
+    for (const p of store.proposals) {
+      if (Array.isArray(p.attachmentIds)) {
+        p.attachmentIds = (p.attachmentIds as string[]).filter((aid) => aid !== id);
+      }
+    }
+
+    // Delete file on disk if local upload and unreferenced
+    const fileUrl = String(removed.fileUrl || '');
+    if (fileUrl.startsWith('/api/uploads/')) {
+      const filename = path.basename(fileUrl);
+      const stillReferenced = store.proposalAttachments.some((a) => a.fileUrl === fileUrl);
+      if (!stillReferenced && /^[a-zA-Z0-9_-]+\.(png|jpg|jpeg|webp|pdf)$/i.test(filename)) {
+        const targetPath = path.resolve(UPLOADS_DIR, filename);
+        if (targetPath.startsWith(UPLOADS_DIR + path.sep) && fs.existsSync(targetPath)) {
+          fs.unlinkSync(targetPath);
+        }
+      }
+    }
+
+    appendAudit(store, {
+      action: 'ATTACHMENT_DELETE',
+      entityType: 'proposalAttachments',
+      entityId: id,
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: `Menghapus lampiran "${String(removed.title || id)}".`,
+    });
+    writeStore(store);
+    res.json({ ok: true });
+  });
+
+  // 8g. System App Settings, Audit Logs, & Admin Backup Export
+  app.put('/api/settings/app', requireAuth, (req: AuthedRequest, res) => {
+    const actor = req.currentUser!;
+    if (actor.role !== 'Administrator' && actor.role !== 'Operator') {
+      res.status(403).json({ error: 'Peran Anda tidak diizinkan mengubah pengaturan dokumen.' });
+      return;
+    }
+    const store = readStore();
+    const body = req.body || {};
+    store.appSettings = {
+      numberPrefix: sanitizeStr(body.numberPrefix, 50) || DEFAULT_APP_SETTINGS.numberPrefix,
+      defaultFiscalYear: sanitizeNum(body.defaultFiscalYear, 2000, 2100) || new Date().getFullYear(),
+      letterCity: sanitizeStr(body.letterCity, 120),
+      paperSize: 'A4',
+      includeLogoInLetterhead: body.includeLogoInLetterhead !== false,
+      footerText: sanitizeStr(body.footerText, 250) || DEFAULT_APP_SETTINGS.footerText,
+    };
+    appendAudit(store, {
+      action: 'APP_SETTINGS_UPDATE',
+      entityType: 'appSettings',
+      entityId: 'ar-raudhah',
+      actorUid: actor.uid,
+      actorName: actor.displayName,
+      details: 'Memperbarui pengaturan penomoran dan tata letak dokumen A4.',
+    });
+    writeStore(store);
+    res.json({ appSettings: store.appSettings });
+  });
+
+  app.get('/api/audit-logs', requireAuth, (req: AuthedRequest, res) => {
+    const store = readStore();
+    const logs = [...store.auditLogs].reverse().slice(0, 200);
+    res.json({ auditLogs: logs });
+  });
+
+  app.get('/api/backup/export', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    const store = readStore();
+    const safeSnapshot = {
+      exportedAt: new Date().toISOString(),
+      institution: store.institution,
+      appSettings: store.appSettings,
+      proposalCategories: store.proposalCategories,
+      proposalTemplates: store.proposalTemplates,
+      proposals: store.proposals,
+      proposalBudgets: store.proposalBudgets,
+      proposalAttachments: store.proposalAttachments,
+      proposalStatusHistory: store.proposalStatusHistory,
+      users: store.users.map(toPublicUser),
+      auditLogs: store.auditLogs,
+    };
+    res.json(safeSnapshot);
   });
 
   // 9. Explicit JSON 404 & error handlers for /api/* so API calls never receive HTML/text 404s

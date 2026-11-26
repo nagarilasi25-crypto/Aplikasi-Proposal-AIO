@@ -48,25 +48,25 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     heading: 'Master & Penyusunan',
     items: [
-      { label: 'Master Template Proposal', to: '/template-proposal', icon: FileText, stage: 'Tahap 2' },
-      { label: 'Kategori Proposal', to: '/kategori-proposal', icon: Tags, stage: 'Tahap 2' },
-      { label: 'Buat Proposal', to: '/buat-proposal', icon: FilePlus2, stage: 'Tahap 2' },
-      { label: 'Daftar Proposal', to: '/daftar-proposal', icon: Files, stage: 'Tahap 2' },
+      { label: 'Master Template Proposal', to: '/template-proposal', icon: FileText },
+      { label: 'Kategori Proposal', to: '/kategori-proposal', icon: Tags },
+      { label: 'Buat Proposal', to: '/buat-proposal', icon: FilePlus2 },
+      { label: 'Daftar Proposal', to: '/daftar-proposal', icon: Files },
     ],
   },
   {
     heading: 'Anggaran & Dokumen',
     items: [
-      { label: 'Rencana Anggaran Biaya', to: '/rab', icon: Calculator, stage: 'Tahap 3' },
-      { label: 'Dokumentasi dan Lampiran', to: '/dokumentasi', icon: ImageIcon, stage: 'Tahap 3' },
+      { label: 'Rencana Anggaran Biaya', to: '/rab', icon: Calculator },
+      { label: 'Dokumentasi dan Lampiran', to: '/dokumentasi', icon: ImageIcon },
     ],
   },
   {
     heading: 'Arsip & Monitoring',
     items: [
-      { label: 'Arsip Proposal', to: '/arsip', icon: Archive, stage: 'Tahap 4' },
-      { label: 'Monitoring Pengajuan', to: '/monitoring', icon: Activity, stage: 'Tahap 5' },
-      { label: 'Laporan', to: '/laporan', icon: BarChart3, stage: 'Tahap 5' },
+      { label: 'Arsip Proposal', to: '/arsip', icon: Archive },
+      { label: 'Monitoring Pengajuan', to: '/monitoring', icon: Activity },
+      { label: 'Laporan', to: '/laporan', icon: BarChart3 },
     ],
   },
   {

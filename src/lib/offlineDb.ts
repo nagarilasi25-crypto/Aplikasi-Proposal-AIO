@@ -1,4 +1,14 @@
-import { AppUser, InstitutionProfile, ProposalCategory, ProposalRecord } from '../types/models';
+import {
+  AppUser,
+  InstitutionProfile,
+  ProposalAttachment,
+  ProposalBudget,
+  ProposalCategory,
+  ProposalRecord,
+  ProposalStatusHistory,
+  ProposalTemplate,
+  SystemAppSettings,
+} from '../types/models';
 
 const DB_NAME = 'arraudhah_offline_db';
 const DB_VERSION = 1;
@@ -472,10 +482,20 @@ export async function cacheDashboardSnapshot(data: {
   institution: InstitutionProfile;
   proposals: ProposalRecord[];
   categories: ProposalCategory[];
+  templates?: ProposalTemplate[];
+  budgets?: ProposalBudget[];
+  attachments?: ProposalAttachment[];
+  statusHistory?: ProposalStatusHistory[];
+  appSettings?: SystemAppSettings;
 }): Promise<void> {
   await setOfflineKV('institution', data.institution);
   await setOfflineKV('proposals', data.proposals);
   await setOfflineKV('categories', data.categories);
+  if (data.templates) await setOfflineKV('templates', data.templates);
+  if (data.budgets) await setOfflineKV('budgets', data.budgets);
+  if (data.attachments) await setOfflineKV('attachments', data.attachments);
+  if (data.statusHistory) await setOfflineKV('statusHistory', data.statusHistory);
+  if (data.appSettings) await setOfflineKV('appSettings', data.appSettings);
 }
 
 export async function enqueueOfflineMutation(
@@ -492,8 +512,14 @@ export async function enqueueOfflineMutation(
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction('syncQueue', 'readwrite');
     const store = tx.objectStore('syncQueue');
+    const incomingEntityId = typeof mutation.body?.id === 'string' ? mutation.body.id : '';
     for (const old of existingQueue) {
-      if (old.endpoint === mutation.endpoint && old.method === mutation.method) {
+      const sameEndpointAndMethod =
+        old.endpoint === mutation.endpoint && old.method === mutation.method;
+      if (!sameEndpointAndMethod) continue;
+      if (mutation.method === 'PUT' || mutation.method === 'PATCH') {
+        store.delete(old.id);
+      } else if (mutation.method === 'POST' && incomingEntityId && old.body?.id === incomingEntityId) {
         store.delete(old.id);
       }
     }

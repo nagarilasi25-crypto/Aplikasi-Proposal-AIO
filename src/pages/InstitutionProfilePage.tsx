@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Building2, Save, Upload, ImageIcon, RotateCcw, Trash2 } from 'lucide-react';
+import { Building2, Save, Upload, ImageIcon, RotateCcw, Trash2, Sparkles } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../components/Toast';
 import {
@@ -16,6 +16,7 @@ export function InstitutionProfilePage() {
     institutionLoading,
     saveInstitution,
     uploadInstitutionImage,
+    generateAiNarrative,
   } = useAuth();
   const { showToast } = useToast();
 
@@ -48,6 +49,10 @@ export function InstitutionProfilePage() {
   const [uploadingField, setUploadingField] = useState<'logoUrl' | 'photoUrl' | null>(null);
   const [logoImgError, setLogoImgError] = useState(false);
   const [photoImgError, setPhotoImgError] = useState(false);
+  const [aiNotes, setAiNotes] = useState('');
+  const [aiGenerating, setAiGenerating] = useState<
+    'history' | 'vision' | 'mission' | 'organizationStructure' | 'all' | null
+  >(null);
 
   useEffect(() => {
     if (institution) {
@@ -201,6 +206,45 @@ export function InstitutionProfilePage() {
       showToast(err instanceof Error ? err.message : 'Gagal menyimpan profil lembaga.', 'error');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleGenerateAi = async (
+    section: 'history' | 'vision' | 'mission' | 'organizationStructure' | 'all'
+  ) => {
+    if (!canEdit) return;
+    setAiGenerating(section);
+    try {
+      const result = await generateAiNarrative({
+        target: 'institution_section',
+        section,
+        institution: buildSanitizedPayload(),
+        userNotes: aiNotes.trim() || undefined,
+      });
+
+      setForm((prev) => ({
+        ...prev,
+        ...(typeof result.history === 'string' && result.history ? { history: result.history } : {}),
+        ...(typeof result.vision === 'string' && result.vision ? { vision: result.vision } : {}),
+        ...(typeof result.mission === 'string' && result.mission ? { mission: result.mission } : {}),
+        ...(typeof result.organizationStructure === 'string' && result.organizationStructure
+          ? { organizationStructure: result.organizationStructure }
+          : {}),
+      }));
+
+      showToast(
+        section === 'all'
+          ? 'Keempat narasi profil berhasil disusun AI. Silakan tinjau lalu klik Simpan Profil Lembaga.'
+          : 'Narasi bagian terpilih berhasil disusun AI. Silakan tinjau lalu klik Simpan Profil Lembaga.',
+        'success'
+      );
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : 'Gagal membuat narasi menggunakan AI.',
+        'error'
+      );
+    } finally {
+      setAiGenerating(null);
     }
   };
 
@@ -625,14 +669,61 @@ export function InstitutionProfilePage() {
 
       {/* Narasi Profil Lembaga */}
       <section className="rounded-xl border border-slate-200 bg-white p-6 space-y-5">
-        <h3 className="font-display text-base font-semibold text-[#111C18]">
-          Sejarah, Visi, Misi, dan Struktur Organisasi
-        </h3>
+        <div className="flex flex-col justify-between gap-4 border-b border-slate-100 pb-4 sm:flex-row sm:items-center">
+          <div>
+            <h3 className="font-display text-base font-semibold text-[#111C18]">
+              Sejarah, Visi, Misi, dan Struktur Organisasi
+            </h3>
+            <p className="mt-1 text-xs text-slate-500">
+              Gunakan asisten AI untuk menyusun narasi resmi berdasarkan data lembaga yang sudah Anda isi di atas.
+            </p>
+          </div>
+          {canEdit && (
+            <button
+              type="button"
+              disabled={aiGenerating !== null}
+              onClick={() => handleGenerateAi('all')}
+              className="inline-flex items-center justify-center gap-2 rounded-lg border border-[#C5A059]/60 bg-[#0F3D2E] px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-[#144D3A] disabled:opacity-60 whitespace-nowrap shrink-0"
+            >
+              <Sparkles className="h-3.5 w-3.5 text-[#F3DFB6]" />
+              {aiGenerating === 'all' ? 'Menyusun Semua Narasi...' : 'Buat Semua Narasi dengan AI'}
+            </button>
+          )}
+        </div>
+
+        {canEdit && (
+          <div className="rounded-lg border border-emerald-900/15 bg-[#F8FAF9] p-4">
+            <label className="block text-xs font-medium text-[#0F3D2E]">
+              Arahan / Konteks Khusus untuk AI (Opsional)
+            </label>
+            <input
+              type="text"
+              value={aiNotes}
+              onChange={(e) => setAiNotes(e.target.value)}
+              maxLength={600}
+              placeholder="Contoh: Fokus pada pembinaan tahfidz Al-Quran anak-anak & remaja, kegiatan sore dan malam, bebas biaya untuk yatim/dhuafa."
+              className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs text-[#111C18] focus:border-[#0F3D2E] focus:outline-none"
+            />
+          </div>
+        )}
 
         <div>
-          <label className="block text-xs font-medium text-slate-700">Sejarah Lembaga</label>
+          <div className="flex items-center justify-between gap-2">
+            <label className="block text-xs font-medium text-slate-700">Sejarah Lembaga</label>
+            {canEdit && (
+              <button
+                type="button"
+                disabled={aiGenerating !== null}
+                onClick={() => handleGenerateAi('history')}
+                className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-[#0F3D2E] hover:bg-slate-50 disabled:opacity-60"
+              >
+                <Sparkles className="h-3 w-3 text-[#C5A059]" />
+                {aiGenerating === 'history' ? 'Menyusun...' : 'Buat dengan AI'}
+              </button>
+            )}
+          </div>
           <textarea
-            rows={4}
+            rows={5}
             disabled={!canEdit}
             maxLength={BLUEPRINT_LIMITS.institution.historyMax}
             value={form.history}
@@ -644,9 +735,22 @@ export function InstitutionProfilePage() {
 
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
           <div>
-            <label className="block text-xs font-medium text-slate-700">Visi Lembaga</label>
+            <div className="flex items-center justify-between gap-2">
+              <label className="block text-xs font-medium text-slate-700">Visi Lembaga</label>
+              {canEdit && (
+                <button
+                  type="button"
+                  disabled={aiGenerating !== null}
+                  onClick={() => handleGenerateAi('vision')}
+                  className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-[#0F3D2E] hover:bg-slate-50 disabled:opacity-60"
+                >
+                  <Sparkles className="h-3 w-3 text-[#C5A059]" />
+                  {aiGenerating === 'vision' ? 'Menyusun...' : 'Buat dengan AI'}
+                </button>
+              )}
+            </div>
             <textarea
-              rows={4}
+              rows={5}
               disabled={!canEdit}
               maxLength={BLUEPRINT_LIMITS.institution.visionMax}
               value={form.vision}
@@ -657,9 +761,22 @@ export function InstitutionProfilePage() {
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-slate-700">Misi Lembaga</label>
+            <div className="flex items-center justify-between gap-2">
+              <label className="block text-xs font-medium text-slate-700">Misi Lembaga</label>
+              {canEdit && (
+                <button
+                  type="button"
+                  disabled={aiGenerating !== null}
+                  onClick={() => handleGenerateAi('mission')}
+                  className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-[#0F3D2E] hover:bg-slate-50 disabled:opacity-60"
+                >
+                  <Sparkles className="h-3 w-3 text-[#C5A059]" />
+                  {aiGenerating === 'mission' ? 'Menyusun...' : 'Buat dengan AI'}
+                </button>
+              )}
+            </div>
             <textarea
-              rows={4}
+              rows={5}
               disabled={!canEdit}
               maxLength={BLUEPRINT_LIMITS.institution.missionMax}
               value={form.mission}
@@ -671,9 +788,22 @@ export function InstitutionProfilePage() {
         </div>
 
         <div>
-          <label className="block text-xs font-medium text-slate-700">Struktur Organisasi</label>
+          <div className="flex items-center justify-between gap-2">
+            <label className="block text-xs font-medium text-slate-700">Struktur Organisasi</label>
+            {canEdit && (
+              <button
+                type="button"
+                disabled={aiGenerating !== null}
+                onClick={() => handleGenerateAi('organizationStructure')}
+                className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-[#0F3D2E] hover:bg-slate-50 disabled:opacity-60"
+              >
+                <Sparkles className="h-3 w-3 text-[#C5A059]" />
+                {aiGenerating === 'organizationStructure' ? 'Menyusun...' : 'Buat dengan AI'}
+              </button>
+            )}
+          </div>
           <textarea
-            rows={4}
+            rows={5}
             disabled={!canEdit}
             maxLength={BLUEPRINT_LIMITS.institution.organizationStructureMax}
             value={form.organizationStructure}

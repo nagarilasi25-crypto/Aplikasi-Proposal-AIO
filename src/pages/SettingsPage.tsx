@@ -1,42 +1,45 @@
 import React, { useEffect, useState } from 'react';
-import { Save } from 'lucide-react';
+import { FileCheck2, Save } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../components/Toast';
-import { BLUEPRINT_LIMITS } from '../types/models';
+import { BLUEPRINT_LIMITS, SystemAppSettings } from '../types/models';
 import { sanitizeString } from '../lib/formatters';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 
 const STAGES = [
   {
     stage: 'Tahap 1',
-    title: 'Struktur Aplikasi, Autentikasi Nama & Sandi, Mode Offline (PWA), Dashboard, Profil Lembaga & Manajemen Pengguna',
+    title: 'Struktur Aplikasi, Autentikasi Nama & Sandi, Mode Offline (PWA), Dashboard, Profil Lembaga (dengan Narasi AI) & Manajemen Pengguna',
     done: true,
   },
   {
     stage: 'Tahap 2',
-    title: 'Master Kategori, Master Template Proposal, Generator & Editor Proposal',
-    done: false,
+    title: 'Master Kategori, Master Template Proposal (10 Template), Generator Proposal (dengan Narasi AI) & Daftar Proposal',
+    done: true,
   },
   {
     stage: 'Tahap 3',
-    title: 'Rencana Anggaran Biaya (RAB) Otomatis, Dokumentasi & Lampiran',
-    done: false,
+    title: 'Rencana Anggaran Biaya (RAB) Otomatis, Dokumentasi & Lampiran Foto/PDF',
+    done: true,
   },
   {
     stage: 'Tahap 4',
-    title: 'Ekspor Word (.docx), Ekspor PDF, dan Arsip Proposal',
-    done: false,
+    title: 'Pratinjau A4, Ekspor Microsoft Word (.docx), Ekspor PDF, dan Arsip Proposal Permanen',
+    done: true,
   },
   {
     stage: 'Tahap 5',
-    title: 'Monitoring Pengajuan, Laporan, serta Audit & Pengujian Akhir',
-    done: false,
+    title: 'Monitoring 9 Status Pengajuan, Laporan Rekapitulasi PDF/CSV, Cadangan Data JSON & Log Audit Sistem',
+    done: true,
   },
 ];
 
 export function SettingsPage() {
-  const { appUser, updateOwnProfile } = useAuth();
+  const { appUser, appSettings, updateOwnProfile, saveAppSettings } = useAuth();
   const { showToast } = useToast();
+
+  const canManageDocSettings =
+    appUser?.role === 'Administrator' || appUser?.role === 'Operator';
 
   const [displayName, setDisplayName] = useState('');
   const [phone, setPhone] = useState('');
@@ -46,6 +49,9 @@ export function SettingsPage() {
   const [recoveryCode, setRecoveryCode] = useState('');
   const [saving, setSaving] = useState(false);
 
+  const [docForm, setDocForm] = useState<SystemAppSettings>(appSettings);
+  const [savingDoc, setSavingDoc] = useState(false);
+
   useEffect(() => {
     if (appUser) {
       setDisplayName(appUser.displayName || '');
@@ -53,6 +59,10 @@ export function SettingsPage() {
       setPosition(appUser.position || '');
     }
   }, [appUser]);
+
+  useEffect(() => {
+    setDocForm(appSettings);
+  }, [appSettings]);
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -93,6 +103,35 @@ export function SettingsPage() {
       showToast(err instanceof Error ? err.message : 'Gagal memperbarui akun.', 'error');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSaveDocSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canManageDocSettings) return;
+    setSavingDoc(true);
+    try {
+      const { queuedOffline } = await saveAppSettings({
+        ...docForm,
+        paperSize: 'A4',
+        numberPrefix: docForm.numberPrefix.trim() || 'PROP/RQ-AR',
+        defaultFiscalYear: Number(docForm.defaultFiscalYear) || new Date().getFullYear(),
+        letterCity: docForm.letterCity.trim(),
+        footerText: docForm.footerText.trim(),
+      });
+      showToast(
+        queuedOffline
+          ? 'Pengaturan dokumen disimpan lokal (offline) dan akan disinkronkan.'
+          : 'Pengaturan dokumen & penomoran proposal berhasil disimpan.',
+        queuedOffline ? 'info' : 'success'
+      );
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : 'Gagal menyimpan pengaturan dokumen.',
+        'error'
+      );
+    } finally {
+      setSavingDoc(false);
     }
   };
 
@@ -237,23 +276,124 @@ export function SettingsPage() {
         </form>
       </section>
 
+      {/* Pengaturan Dokumen & Penomoran Proposal */}
+      <section className="rounded-xl border border-slate-200 bg-white p-6">
+        <div className="flex items-center gap-2">
+          <FileCheck2 className="h-5 w-5 text-[#0F3D2E]" />
+          <div>
+            <h3 className="font-display text-base font-semibold text-[#111C18]">
+              Pengaturan Dokumen A4 & Penomoran Proposal
+            </h3>
+            <p className="text-xs text-slate-500">
+              Mengatur format nomor surat otomatis, kota tempat penandatanganan, kop surat, dan footer dokumen Word/PDF.
+            </p>
+          </div>
+        </div>
+
+        <form onSubmit={handleSaveDocSettings} className="mt-5 max-w-2xl space-y-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-700">
+                Awalan Nomor Proposal
+              </label>
+              <input
+                type="text"
+                disabled={!canManageDocSettings}
+                value={docForm.numberPrefix}
+                onChange={(e) => setDocForm((p) => ({ ...p, numberPrefix: e.target.value }))}
+                placeholder="PROP/RQ-AR"
+                className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2 font-mono text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none disabled:bg-slate-50"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700">
+                Tahun Anggaran Bawaan
+              </label>
+              <input
+                type="number"
+                min={2000}
+                max={2100}
+                disabled={!canManageDocSettings}
+                value={docForm.defaultFiscalYear}
+                onChange={(e) =>
+                  setDocForm((p) => ({ ...p, defaultFiscalYear: Number(e.target.value) }))
+                }
+                className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2 font-mono text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none disabled:bg-slate-50"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700">
+                Kota / Nagari Tanda Tangan
+              </label>
+              <input
+                type="text"
+                disabled={!canManageDocSettings}
+                value={docForm.letterCity}
+                onChange={(e) => setDocForm((p) => ({ ...p, letterCity: e.target.value }))}
+                placeholder="Contoh: Agam / Lasi"
+                className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none disabled:bg-slate-50"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-slate-700">
+              Catatan Kaki (Footer) Dokumen PDF
+            </label>
+            <input
+              type="text"
+              disabled={!canManageDocSettings}
+              value={docForm.footerText}
+              onChange={(e) => setDocForm((p) => ({ ...p, footerText: e.target.value }))}
+              placeholder="Contoh: Dokumen Resmi Pengajuan Proposal"
+              className="mt-1.5 w-full rounded-lg border border-slate-200 px-3.5 py-2 text-sm text-[#111C18] focus:border-[#0F3D2E] focus:outline-none disabled:bg-slate-50"
+            />
+          </div>
+
+          <label className="flex items-center gap-2.5 text-xs font-medium text-slate-700">
+            <input
+              type="checkbox"
+              disabled={!canManageDocSettings}
+              checked={docForm.includeLogoInLetterhead}
+              onChange={(e) =>
+                setDocForm((p) => ({ ...p, includeLogoInLetterhead: e.target.checked }))
+              }
+              className="h-4 w-4 rounded border-slate-300 text-[#0F3D2E] focus:ring-[#0F3D2E]"
+            />
+            Sertakan Logo Lembaga pada Kop Surat saat Pratinjau dan Ekspor Word/PDF
+          </label>
+
+          {canManageDocSettings && (
+            <div className="pt-2">
+              <button
+                type="submit"
+                disabled={savingDoc}
+                className="inline-flex items-center gap-2 rounded-lg bg-[#0F3D2E] px-5 py-2.5 text-xs font-semibold text-white hover:bg-[#144D3A] disabled:opacity-60"
+              >
+                <Save className="h-4 w-4" />
+                {savingDoc ? 'Menyimpan...' : 'Simpan Pengaturan Dokumen'}
+              </button>
+            </div>
+          )}
+        </form>
+      </section>
+
       <section className="rounded-xl border border-slate-200 bg-white p-6">
         <h3 className="font-display text-base font-semibold text-[#111C18]">
-          Tahapan Pembangunan Sistem
+          Status Kelengkapan Modul Sistem
         </h3>
         <div className="mt-4 divide-y divide-slate-100">
           {STAGES.map((item) => (
-            <div key={item.stage} className="flex flex-col justify-between gap-2 py-3.5 sm:flex-row sm:items-center">
+            <div
+              key={item.stage}
+              className="flex flex-col justify-between gap-2 py-3.5 sm:flex-row sm:items-center"
+            >
               <div>
                 <p className="text-xs font-semibold text-[#0F3D2E]">{item.stage}</p>
                 <p className="mt-0.5 text-sm text-[#111C18]">{item.title}</p>
               </div>
-              <span
-                className={`text-xs font-medium whitespace-nowrap ${
-                  item.done ? 'text-[#16A34A]' : 'text-slate-500'
-                }`}
-              >
-                {item.done ? 'Aktif & Terverifikasi' : 'Dijadwalkan'}
+              <span className="text-xs font-medium text-[#16A34A] whitespace-nowrap">
+                Aktif & Terverifikasi
               </span>
             </div>
           ))}

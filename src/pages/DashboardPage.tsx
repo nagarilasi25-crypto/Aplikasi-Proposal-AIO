@@ -6,6 +6,10 @@ import {
   ArrowUpRight,
   FolderOpen,
   Users,
+  FilePlus2,
+  Calculator,
+  Archive,
+  Activity,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import {
@@ -235,7 +239,7 @@ export function DashboardPage() {
                   Belum ada data proposal
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  Grafik berdasarkan {selectedChartMode} akan tampil otomatis setelah proposal dibuat pada Tahap 2.
+                  Grafik berdasarkan {selectedChartMode} akan tampil otomatis setelah proposal pertama dibuat.
                 </p>
               </div>
             ) : (
@@ -300,8 +304,15 @@ export function DashboardPage() {
                   Belum ada proposal tercatat
                 </p>
                 <p className="mt-1 max-w-sm text-xs text-slate-500">
-                  Seluruh angka di dashboard bernilai nol karena data proposal masih kosong. Modul pembuatan proposal tersedia di Tahap 2.
+                  Seluruh angka di dashboard masih nol karena belum ada proposal tersimpan. Mulai susun proposal baru sekarang.
                 </p>
+                <Link
+                  to="/buat-proposal"
+                  className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-[#0F3D2E] px-4 py-2 text-xs font-semibold text-white hover:bg-[#144D3A]"
+                >
+                  <FilePlus2 className="h-3.5 w-3.5" />
+                  Buat Proposal Baru
+                </Link>
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -344,37 +355,65 @@ export function DashboardPage() {
         </section>
       </div>
 
-      {/* Quick Administrative Navigation */}
-      {appUser?.role === 'Administrator' && (
-        <section className="rounded-xl border border-slate-200 bg-white p-5 sm:p-6">
-          <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-            <div>
-              <h3 className="font-display text-sm font-semibold text-[#111C18]">
-                Aksi Cepat Administrator (Tahap 1)
-              </h3>
-              <p className="mt-1 text-xs text-slate-500">
-                Lengkapi data profil lembaga dan kelola hak akses pengguna (nama & sandi).
-              </p>
-            </div>
-            <div className="flex flex-wrap items-center gap-3">
-              <Link
-                to="/profil-lembaga"
-                className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
-              >
-                <Building2 className="h-4 w-4 text-[#0F3D2E]" />
-                Lengkapi Profil Lembaga
-              </Link>
+      {/* Quick Navigation */}
+      <section className="rounded-xl border border-slate-200 bg-white p-5 sm:p-6">
+        <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
+          <div>
+            <h3 className="font-display text-sm font-semibold text-[#111C18]">
+              Akses Cepat Modul Utama
+            </h3>
+            <p className="mt-1 text-xs text-slate-500">
+              Navigasi langsung ke penyusunan proposal, anggaran RAB, arsip ekspor Word/PDF, dan monitoring.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <Link
+              to="/buat-proposal"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[#0F3D2E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#144D3A] whitespace-nowrap"
+            >
+              <FilePlus2 className="h-3.5 w-3.5" />
+              Buat Proposal
+            </Link>
+            <Link
+              to="/rab"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Calculator className="h-3.5 w-3.5 text-[#0F3D2E]" />
+              Kelola RAB
+            </Link>
+            <Link
+              to="/arsip"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Archive className="h-3.5 w-3.5 text-[#0F3D2E]" />
+              Arsip & Ekspor
+            </Link>
+            <Link
+              to="/monitoring"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Activity className="h-3.5 w-3.5 text-[#0F3D2E]" />
+              Monitoring
+            </Link>
+            <Link
+              to="/profil-lembaga"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Building2 className="h-3.5 w-3.5 text-[#0F3D2E]" />
+              Profil Lembaga
+            </Link>
+            {appUser?.role === 'Administrator' && (
               <Link
                 to="/pengguna"
-                className="inline-flex items-center gap-2 rounded-lg bg-[#0F3D2E] px-4 py-2 text-xs font-medium text-white hover:bg-[#144D3A] whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
               >
-                <Users className="h-4 w-4" />
+                <Users className="h-3.5 w-3.5 text-[#0F3D2E]" />
                 Kelola Pengguna
               </Link>
-            </div>
+            )}
           </div>
-        </section>
-      )}
+        </div>
+      </section>
     </div>
   );
 }
