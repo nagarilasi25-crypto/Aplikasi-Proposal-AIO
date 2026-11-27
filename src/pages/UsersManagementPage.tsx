@@ -29,6 +29,10 @@ import {
   updateOfflineAuthUserMetadata,
 } from '../lib/offlineDb';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
+import {
+  fetchAllFirestoreUsersForAdmin,
+  updateFirestoreUserForAdmin,
+} from '../lib/firestoreSync';
 
 const STATUS_LABELS: Record<UserStatus, string> = {
   active: 'Aktif',
@@ -37,7 +41,7 @@ const STATUS_LABELS: Record<UserStatus, string> = {
 };
 
 export function UsersManagementPage() {
-  const { appUser, isOfflineSession, apiRequest } = useAuth();
+  const { appUser, isOfflineSession, firestoreConnected, apiRequest } = useAuth();
   const { showToast } = useToast();
   const isOnline = useOnlineStatus();
 
@@ -120,25 +124,51 @@ export function UsersManagementPage() {
     }
     setLoading(true);
     try {
-      if (useServerApi) {
-        const res = await apiRequest<{ users: AppUser[] }>('/api/users');
-        const list = (res.users || []).sort((a, b) =>
-          a.displayName.localeCompare(b.displayName)
-        );
-        setUsers(list);
-        await setOfflineKV('users', list);
-      } else {
-        const merged = await loadLocalMergedUsers();
-        setUsers(merged);
-        await setOfflineKV('users', merged);
+      const byUid = new Map<string, AppUser>();
+      const localMerged = await loadLocalMergedUsers();
+      for (const u of localMerged) {
+        byUid.set(u.uid, u);
       }
+
+      if (useServerApi) {
+        try {
+          const res = await apiRequest<{ users: AppUser[] }>('/api/users');
+          for (const u of res.users || []) {
+            byUid.set(u.uid, u);
+          }
+        } catch {
+          // Keep local/Firestore users if server /api/users fails
+        }
+      }
+
+      if (isOnline && firestoreConnected) {
+        try {
+          const firestoreUsers = await fetchAllFirestoreUsersForAdmin();
+          for (const fu of firestoreUsers) {
+            const existing = byUid.get(fu.uid);
+            byUid.set(fu.uid, {
+              ...existing,
+              ...fu,
+              username: existing?.username || fu.username,
+            });
+          }
+        } catch {
+          // Non-fatal if Firestore list query is unavailable
+        }
+      }
+
+      const list = Array.from(byUid.values()).sort((a, b) =>
+        a.displayName.localeCompare(b.displayName)
+      );
+      setUsers(list);
+      await setOfflineKV('users', list);
     } catch {
       const merged = await loadLocalMergedUsers();
       setUsers(merged);
     } finally {
       setLoading(false);
     }
-  }, [apiRequest, isAdmin, loadLocalMergedUsers, useServerApi]);
+  }, [apiRequest, firestoreConnected, isAdmin, isOnline, loadLocalMergedUsers, useServerApi]);
 
   useEffect(() => {
     loadUsers();
@@ -153,6 +183,7 @@ export function UsersManagementPage() {
       return (
         u.displayName.toLowerCase().includes(q) ||
         (u.username || '').toLowerCase().includes(q) ||
+        (u.email || '').toLowerCase().includes(q) ||
         (u.position || '').toLowerCase().includes(q)
       );
     });
@@ -292,20 +323,37 @@ export function UsersManagementPage() {
 
     setSavingEdit(true);
     try {
+      let updatedInFirestore = false;
+      if (isOnline && firestoreConnected) {
+        updatedInFirestore = await updateFirestoreUserForAdmin(editingUser.uid, {
+          displayName: cleanName,
+          phone: cleanPhone,
+          position: cleanPosition,
+          role: editForm.role,
+          status: editForm.status,
+        }).catch(() => false);
+      }
+
       if (useServerApi) {
-        await apiRequest(`/api/users/${editingUser.uid}`, {
-          method: 'PATCH',
-          body: {
-            username: cleanUsername,
-            displayName: cleanName,
-            phone: cleanPhone,
-            position: cleanPosition,
-            role: editForm.role,
-            status: editForm.status,
-            newPassword: editForm.newPassword || undefined,
-            recoveryCode: cleanRecovery || undefined,
-          },
-        });
+        try {
+          await apiRequest(`/api/users/${editingUser.uid}`, {
+            method: 'PATCH',
+            body: {
+              username: cleanUsername,
+              displayName: cleanName,
+              phone: cleanPhone,
+              position: cleanPosition,
+              role: editForm.role,
+              status: editForm.status,
+              newPassword: editForm.newPassword || undefined,
+              recoveryCode: cleanRecovery || undefined,
+            },
+          });
+        } catch (err) {
+          if (!updatedInFirestore) {
+            throw err;
+          }
+        }
       } else {
         await updateOfflineAuthUserMetadata(
           editingUser.uid,
@@ -353,17 +401,34 @@ export function UsersManagementPage() {
   const handleQuickActivate = async (user: AppUser) => {
     if (!canMutate || !appUser) return;
     try {
+      let updatedInFirestore = false;
+      if (isOnline && firestoreConnected) {
+        updatedInFirestore = await updateFirestoreUserForAdmin(user.uid, {
+          displayName: user.displayName,
+          phone: user.phone || '',
+          position: user.position || '',
+          role: user.role,
+          status: 'active',
+        }).catch(() => false);
+      }
+
       if (useServerApi) {
-        await apiRequest(`/api/users/${user.uid}`, {
-          method: 'PATCH',
-          body: {
-            displayName: user.displayName,
-            phone: user.phone || '',
-            position: user.position || '',
-            role: user.role,
-            status: 'active',
-          },
-        });
+        try {
+          await apiRequest(`/api/users/${user.uid}`, {
+            method: 'PATCH',
+            body: {
+              displayName: user.displayName,
+              phone: user.phone || '',
+              position: user.position || '',
+              role: user.role,
+              status: 'active',
+            },
+          });
+        } catch (err) {
+          if (!updatedInFirestore) {
+            throw err;
+          }
+        }
       } else {
         await updateOfflineAuthUserMetadata(user.uid, {
           status: 'active',
@@ -538,6 +603,9 @@ export function UsersManagementPage() {
                         <p className="mt-0.5 font-mono text-xs text-slate-500">
                           @{u.username || u.displayName}
                         </p>
+                        {u.email && (
+                          <p className="mt-0.5 text-[11px] text-emerald-700">{u.email}</p>
+                        )}
                       </td>
                       <td className="py-3.5 pr-4 text-xs text-slate-600">
                         <p>{u.position || '-'}</p>

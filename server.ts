@@ -13,10 +13,192 @@ import {
 } from './src/lib/defaultSeeds.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const IS_VERCEL = Boolean(process.env.VERCEL);
+const DATA_DIR = IS_VERCEL
+  ? path.resolve('/tmp', 'arraudhah-data')
+  : path.resolve(process.cwd(), 'data');
 const UPLOADS_DIR = path.resolve(DATA_DIR, 'uploads');
 const STORE_FILE = path.join(DATA_DIR, 'arraudhah-store.json');
 const SESSION_SECRET_FILE = path.join(DATA_DIR, '.session-secret');
+
+interface FirebaseConfigFile {
+  projectId?: string;
+  firestoreDatabaseId?: string;
+}
+
+function loadFirebaseRuntimeConfig(): { projectId: string; databaseId: string } {
+  let fileCfg: FirebaseConfigFile = {};
+  try {
+    const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (fs.existsSync(cfgPath)) {
+      fileCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as FirebaseConfigFile;
+    }
+  } catch {
+    fileCfg = {};
+  }
+  const projectId =
+    (process.env.VITE_FIREBASE_PROJECT_ID || '').trim() ||
+    (fileCfg.projectId || '').trim() ||
+    'notional-honor-7gtt6';
+  const databaseId =
+    (process.env.VITE_FIREBASE_DATABASE_ID || '').trim() ||
+    (fileCfg.firestoreDatabaseId || '').trim() ||
+    'ai-studio-8193eb73-84ad-4e1f-a154-7eefda2640f8';
+  return { projectId, databaseId };
+}
+
+const FIREBASE_RUNTIME = loadFirebaseRuntimeConfig();
+const BOOTSTRAPPED_ADMIN_EMAIL = 'nagarilasi25@gmail.com';
+
+let cachedGoogleCerts: Record<string, string> = {};
+let cachedGoogleCertsExpiry = 0;
+
+async function fetchGoogleSecureTokenCerts(): Promise<Record<string, string>> {
+  if (Date.now() < cachedGoogleCertsExpiry && Object.keys(cachedGoogleCerts).length > 0) {
+    return cachedGoogleCerts;
+  }
+  const res = await fetch(
+    'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com'
+  );
+  if (!res.ok) {
+    throw new Error('Gagal mengambil sertifikat verifikasi Firebase Auth.');
+  }
+  const certs = (await res.json()) as Record<string, string>;
+  const cacheControl = res.headers.get('cache-control') || '';
+  const maxAgeMatch = /max-age=(\d+)/i.exec(cacheControl);
+  const maxAgeSec = maxAgeMatch ? Number(maxAgeMatch[1]) : 3600;
+  cachedGoogleCerts = certs;
+  cachedGoogleCertsExpiry = Date.now() + Math.max(60, maxAgeSec) * 1000;
+  return certs;
+}
+
+interface VerifiedFirebaseToken {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  name: string;
+  picture: string;
+}
+
+async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFirebaseToken> {
+  const parts = idToken.split('.');
+  if (parts.length !== 3) {
+    throw new Error('Format token Firebase tidak valid.');
+  }
+  const [headerB64, payloadB64, signatureB64] = parts;
+  const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8')) as {
+    alg?: string;
+    kid?: string;
+  };
+  if (header.alg !== 'RS256' || !header.kid) {
+    throw new Error('Algoritma atau kunci token Firebase tidak valid.');
+  }
+
+  let certs = await fetchGoogleSecureTokenCerts();
+  let pem = certs[header.kid];
+  if (!pem) {
+    cachedGoogleCertsExpiry = 0;
+    certs = await fetchGoogleSecureTokenCerts();
+    pem = certs[header.kid];
+  }
+  if (!pem) {
+    throw new Error('Sertifikat penanda token Firebase tidak ditemukan.');
+  }
+
+  const verifier = crypto.createVerify('RSA-SHA256');
+  verifier.update(`${headerB64}.${payloadB64}`);
+  verifier.end();
+  const signatureBuf = Buffer.from(signatureB64, 'base64url');
+  if (!verifier.verify(pem, signatureBuf)) {
+    throw new Error('Tanda tangan token Firebase tidak sah.');
+  }
+
+  const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as {
+    aud?: string;
+    iss?: string;
+    sub?: string;
+    exp?: number;
+    iat?: number;
+    email?: string;
+    email_verified?: boolean;
+    name?: string;
+    picture?: string;
+  };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const expectedIssuer = `https://securetoken.google.com/${FIREBASE_RUNTIME.projectId}`;
+  if (payload.aud !== FIREBASE_RUNTIME.projectId) {
+    throw new Error(
+      `Token Firebase berasal dari proyek berbeda (${payload.aud || 'tidak diketahui'}).`
+    );
+  }
+  if (payload.iss !== expectedIssuer) {
+    throw new Error('Issuer token Firebase tidak sesuai.');
+  }
+  if (!payload.sub || typeof payload.sub !== 'string' || payload.sub.length > 128) {
+    throw new Error('Subject UID Firebase tidak valid.');
+  }
+  if (!payload.exp || payload.exp <= nowSec) {
+    throw new Error('Token Firebase sudah kedaluwarsa.');
+  }
+  if (!payload.iat || payload.iat > nowSec + 300) {
+    throw new Error('Waktu penerbitan token Firebase tidak valid.');
+  }
+  if (!payload.email || !payload.email_verified) {
+    throw new Error('Email akun Firebase harus sudah terverifikasi.');
+  }
+
+  return {
+    uid: payload.sub,
+    email: payload.email,
+    emailVerified: Boolean(payload.email_verified),
+    name: payload.name || payload.email,
+    picture: payload.picture || '',
+  };
+}
+
+async function fetchFirestoreUserDocWithIdToken(
+  uid: string,
+  idToken: string
+): Promise<{
+  role?: UserRole;
+  status?: UserStatus;
+  displayName?: string;
+  phone?: string;
+  position?: string;
+} | null> {
+  const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    FIREBASE_RUNTIME.projectId
+  )}/databases/${encodeURIComponent(
+    FIREBASE_RUNTIME.databaseId
+  )}/documents/users/${encodeURIComponent(uid)}`;
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      Accept: 'application/json',
+    },
+  });
+  if (!res.ok) return null;
+  const json = (await res.json()) as {
+    fields?: Record<string, { stringValue?: string }>;
+  };
+  const f = json.fields || {};
+  const rawRole = f.role?.stringValue;
+  const rawStatus = f.status?.stringValue;
+  return {
+    role:
+      rawRole === 'Administrator' || rawRole === 'Pimpinan' || rawRole === 'Operator'
+        ? rawRole
+        : undefined,
+    status:
+      rawStatus === 'active' || rawStatus === 'pending' || rawStatus === 'inactive'
+        ? rawStatus
+        : undefined,
+    displayName: f.displayName?.stringValue,
+    phone: f.phone?.stringValue,
+    position: f.position?.stringValue,
+  };
+}
 
 function loadOrCreateSessionSecret(): string {
   const envSecret = (process.env.SESSION_SECRET || '').trim();
@@ -518,12 +700,16 @@ function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
   next();
 }
 
-async function startServer() {
+export function createApiApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: '10mb' }));
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true });
+    res.json({
+      ok: true,
+      firebaseProjectId: FIREBASE_RUNTIME.projectId,
+      firestoreDatabaseId: FIREBASE_RUNTIME.databaseId,
+    });
   });
 
   app.get('/api/uploads/:filename', (req, res) => {
@@ -562,7 +748,121 @@ async function startServer() {
     res.json({
       needsSetup,
       hasEnvAdminPasscode: Boolean(ENV_ADMIN_PASSCODE),
+      firebaseProjectId: FIREBASE_RUNTIME.projectId,
     });
+  });
+
+  // 1b. Authenticate server session using verified Firebase Google ID Token
+  app.post('/api/auth/firebase-session', async (req, res) => {
+    const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
+    if (!idToken) {
+      res.status(400).json({ error: 'Token Firebase ID wajib disertakan.' });
+      return;
+    }
+
+    try {
+      const verified = await verifyFirebaseIdToken(idToken);
+      const store = readStore();
+      const isBootstrapAdmin =
+        verified.email.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
+
+      const firestoreDoc = await fetchFirestoreUserDocWithIdToken(verified.uid, idToken).catch(
+        () => null
+      );
+
+      let target = store.users.find(
+        (u) =>
+          u.uid === verified.uid ||
+          (u.email && u.email.toLowerCase() === verified.email.toLowerCase())
+      );
+
+      const resolvedRole: UserRole =
+        firestoreDoc?.role ||
+        target?.role ||
+        (isBootstrapAdmin ? 'Administrator' : 'Operator');
+      const resolvedStatus: UserStatus =
+        firestoreDoc?.status ||
+        target?.status ||
+        (isBootstrapAdmin ? 'active' : 'pending');
+
+      if (!target) {
+        const baseUsername = sanitizeStr(verified.email.split('@')[0] || verified.uid, 60) || verified.uid;
+        const usernameTaken = store.users.some(
+          (u) => u.username.toLowerCase() === baseUsername.toLowerCase()
+        );
+        const now = new Date().toISOString();
+        target = {
+          uid: verified.uid,
+          username: usernameTaken ? `${baseUsername}_${verified.uid.slice(0, 5)}` : baseUsername,
+          displayName: sanitizeStr(
+            firestoreDoc?.displayName || verified.name || verified.email,
+            150
+          ),
+          email: sanitizeStr(verified.email, 200),
+          phone: sanitizeStr(firestoreDoc?.phone || '', 50),
+          position: sanitizeStr(
+            firestoreDoc?.position ||
+              (resolvedRole === 'Administrator' ? 'Administrator Sistem' : ''),
+            150
+          ),
+          role: resolvedRole,
+          status: resolvedStatus,
+          passwordSalt: '',
+          passwordHash: '',
+          createdAt: now,
+          updatedAt: now,
+          createdBy: verified.uid,
+          updatedBy: verified.uid,
+        };
+        store.users.push(target);
+      } else {
+        target.email = sanitizeStr(verified.email, 200);
+        target.displayName =
+          sanitizeStr(firestoreDoc?.displayName || verified.name || target.displayName, 150) ||
+          target.displayName;
+        target.role = resolvedRole;
+        target.status = resolvedStatus;
+        if (firestoreDoc?.phone !== undefined) {
+          target.phone = sanitizeStr(firestoreDoc.phone, 50);
+        }
+        if (firestoreDoc?.position) {
+          target.position = sanitizeStr(firestoreDoc.position, 150);
+        }
+        target.updatedAt = new Date().toISOString();
+        target.updatedBy = verified.uid;
+      }
+
+      writeStore(store);
+
+      if (target.status === 'pending') {
+        res.status(403).json({
+          code: 'ACCOUNT_PENDING',
+          error: 'Akun Firebase Anda berstatus Menunggu Aktivasi oleh Administrator.',
+          user: toPublicUser(target),
+        });
+        return;
+      }
+
+      if (target.status === 'inactive') {
+        res.status(403).json({
+          code: 'ACCOUNT_INACTIVE',
+          error: 'Akun Anda telah dinonaktifkan oleh Administrator.',
+          user: toPublicUser(target),
+        });
+        return;
+      }
+
+      const token = signSessionToken(target.uid, target.role);
+      res.json({
+        token,
+        user: toPublicUser(target),
+        institution: store.institution,
+      });
+    } catch (err) {
+      res.status(401).json({
+        error: err instanceof Error ? err.message : 'Verifikasi token Firebase gagal.',
+      });
+    }
   });
 
   // 2. First-run admin claim (Nama + Sandi, no email required)
@@ -3048,6 +3348,11 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
     res.status(500).json({ error: message });
   });
 
+  return app;
+}
+
+async function startServer() {
+  const app = createApiApp();
   const httpServer = http.createServer(app);
 
   // Mount Vite middleware in dev, or serve static dist/ in production
@@ -3077,4 +3382,10 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
   });
 }
 
-startServer();
+const entryFile = process.argv[1] ? path.resolve(process.argv[1]) : '';
+const isDirectExecution =
+  entryFile.endsWith(`${path.sep}server.ts`) || entryFile.endsWith(`${path.sep}server.js`);
+
+if (!process.env.VERCEL && isDirectExecution) {
+  startServer();
+}

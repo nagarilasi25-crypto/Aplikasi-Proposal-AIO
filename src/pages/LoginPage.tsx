@@ -31,6 +31,7 @@ export function LoginPage() {
     authError,
     authNotice,
     clearAuthMessages,
+    signInWithFirebaseGoogle,
     setupFirstAdmin,
     signInWithUsername,
     registerWithUsername,
@@ -74,7 +75,11 @@ export function LoginPage() {
   const [showLocalResetConfirm, setShowLocalResetConfirm] = useState(false);
   const [localResetKeyword, setLocalResetKeyword] = useState('');
 
+  const [showCreateFirstAdmin, setShowCreateFirstAdmin] = useState(false);
+
   const [localError, setLocalError] = useState<string | null>(null);
+
+  const isSetupView = needsSetup && showCreateFirstAdmin;
 
   const isPending = pendingStatusUser?.status === 'pending';
   const isInactive = pendingStatusUser?.status === 'inactive';
@@ -92,7 +97,7 @@ export function LoginPage() {
     setLocalError(null);
     clearAuthMessages();
 
-    if (needsSetup) {
+    if (isSetupView) {
       if (username.trim().length < 3) {
         setLocalError('Nama pengguna minimal 3 karakter.');
         return;
@@ -300,9 +305,9 @@ export function LoginPage() {
         </div>
 
         <div className="mt-10 border-t border-white/15 pt-6 text-xs leading-relaxed text-white/70">
-          <p className="font-medium text-white">Masuk Menggunakan Nama & Sandi</p>
+          <p className="font-medium text-white">Autentikasi Terpadu Online & Offline</p>
           <p className="mt-1">
-            Tidak memerlukan akun Google maupun integrasi email pengguna.
+            Masuk menggunakan akun Google Firebase terdaftar untuk memulihkan data Cloud Firestore, atau gunakan Nama Pengguna & Kata Sandi untuk akses cepat dan mode offline.
           </p>
         </div>
       </div>
@@ -454,7 +459,7 @@ export function LoginPage() {
             </div>
           ) : (
             <div>
-              {!needsSetup && (
+              {!isSetupView && (
                 <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-1">
                   <button
                     type="button"
@@ -493,7 +498,7 @@ export function LoginPage() {
               )}
 
               <h2 className="mt-5 font-display text-2xl font-bold text-[#111C18]">
-                {needsSetup
+                {isSetupView
                   ? 'Buat Akun Administrator Pertama'
                   : mode === 'login'
                   ? 'Masuk ke Sistem'
@@ -502,14 +507,75 @@ export function LoginPage() {
                   : 'Pemulihan & Reset Akun'}
               </h2>
               <p className="mt-1.5 text-sm leading-relaxed text-slate-600">
-                {needsSetup
-                  ? 'Belum ada Administrator terdaftar. Tentukan nama pengguna dan kata sandi Administrator utama.'
+                {isSetupView
+                  ? 'Buat akun Administrator lokal baru apabila Anda belum pernah memiliki akun Admin sebelumnya.'
                   : mode === 'login'
-                  ? 'Masukkan nama pengguna dan kata sandi Anda (tanpa email).'
+                  ? 'Gunakan akun Google Firebase Admin/Staf lama untuk memulihkan data Firestore, atau masuk dengan Nama Pengguna & Sandi.'
                   : mode === 'register'
                   ? 'Buat akun baru menggunakan nama pengguna dan kata sandi.'
                   : 'Cari nama pengguna yang terlupa atau atur ulang kata sandi menggunakan kode pemulihan.'}
               </p>
+
+              {(mode === 'login' || isSetupView) && (
+                <div className="mt-5 rounded-xl border border-[#0F3D2E]/20 bg-[#0F3D2E]/[0.03] p-4">
+                  <button
+                    type="button"
+                    disabled={signingIn || !isOnline}
+                    onClick={signInWithFirebaseGoogle}
+                    className="inline-flex w-full items-center justify-center gap-2.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-[#111C18] shadow-xs transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        fill="#4285F4"
+                        d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                      />
+                      <path
+                        fill="#34A853"
+                        d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                      />
+                      <path
+                        fill="#FBBC05"
+                        d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                      />
+                      <path
+                        fill="#EA4335"
+                        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                      />
+                    </svg>
+                    <span>
+                      {signingIn
+                        ? 'Menghubungkan ke Firebase...'
+                        : 'Masuk dengan Akun Admin / Staf Lama (Google)'}
+                    </span>
+                  </button>
+                  <p className="mt-2 text-[11px] leading-relaxed text-slate-600">
+                    {isOnline
+                      ? 'Login Google Firebase memulihkan akses akun Admin lama beserta seluruh data proposal dan profil lembaga di Cloud Firestore tanpa membuat akun baru.'
+                      : 'Login Google memerlukan koneksi internet. Gunakan formulir di bawah untuk masuk secara offline.'}
+                  </p>
+                </div>
+              )}
+
+              {needsSetup && (
+                <div className="mt-3 flex items-center justify-between rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-950">
+                  <span>
+                    {isSetupView
+                      ? 'Sudah punya akun Google / akun lama?'
+                      : 'Belum pernah punya akun Admin sama sekali?'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowCreateFirstAdmin(!isSetupView);
+                      setLocalError(null);
+                      clearAuthMessages();
+                    }}
+                    className="font-semibold text-[#0F3D2E] underline underline-offset-2 hover:text-[#144D3A]"
+                  >
+                    {isSetupView ? 'Kembali ke Masuk' : 'Buat Admin Baru'}
+                  </button>
+                </div>
+              )}
 
               {visibleError && (
                 <div
@@ -528,7 +594,7 @@ export function LoginPage() {
                 </div>
               )}
 
-              {!needsSetup && mode === 'recover' ? (
+              {!isSetupView && mode === 'recover' ? (
                 <div className="mt-5 space-y-5">
                   <div className="grid grid-cols-2 gap-2">
                     <button
@@ -785,7 +851,7 @@ export function LoginPage() {
                     />
                   </div>
 
-                  {(needsSetup || mode === 'register') && (
+                  {(isSetupView || mode === 'register') && (
                     <div>
                       <label className="block text-xs font-medium text-slate-700">
                         Nama Lengkap / Tampilan
@@ -808,7 +874,7 @@ export function LoginPage() {
                       type="password"
                       required
                       minLength={6}
-                      autoComplete={needsSetup || mode === 'register' ? 'new-password' : 'current-password'}
+                      autoComplete={isSetupView || mode === 'register' ? 'new-password' : 'current-password'}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       placeholder="Minimal 6 karakter"
@@ -816,7 +882,7 @@ export function LoginPage() {
                     />
                   </div>
 
-                  {(needsSetup || mode === 'register') && (
+                  {(isSetupView || mode === 'register') && (
                     <>
                       <div>
                         <label className="block text-xs font-medium text-slate-700">
@@ -834,7 +900,7 @@ export function LoginPage() {
                         />
                       </div>
 
-                      {!needsSetup && mode === 'register' && (
+                      {!isSetupView && mode === 'register' && (
                         <div className="space-y-3">
                           <div>
                             <label className="block text-xs font-medium text-slate-700">
@@ -908,19 +974,19 @@ export function LoginPage() {
                     disabled={signingIn}
                     className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[#0F3D2E] px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-[#144D3A] disabled:cursor-not-allowed disabled:opacity-60"
                   >
-                    {needsSetup || mode === 'register' ? (
+                    {isSetupView || mode === 'register' ? (
                       <>
                         <UserPlus className="h-4 w-4" />
                         {signingIn
                           ? 'Memproses...'
-                          : needsSetup
+                          : isSetupView
                           ? 'Simpan & Masuk sebagai Administrator'
                           : 'Daftarkan Akun'}
                       </>
                     ) : (
                       <>
                         <LogIn className="h-4 w-4" />
-                        {signingIn ? 'Memeriksa...' : 'Masuk'}
+                        {signingIn ? 'Memeriksa...' : 'Masuk dengan Nama & Sandi'}
                       </>
                     )}
                   </button>
@@ -931,8 +997,8 @@ export function LoginPage() {
                 <div className="flex items-start gap-2.5 text-xs leading-relaxed text-slate-500">
                   <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[#0F3D2E]" />
                   <p>
-                    {needsSetup
-                      ? 'Pengaturan awal ini hanya muncul satu kali sebelum akun Administrator pertama dibuat.'
+                    {isSetupView
+                      ? 'Jika sebelumnya Anda sudah menggunakan akun Google Admin, gunakan tombol Masuk dengan Google di atas agar akun dan data lama langsung pulih.'
                       : mode === 'recover'
                       ? 'Jika kode pemulihan belum diatur, Administrator tetap dapat mereset nama pengguna dan kata sandi melalui menu Manajemen Pengguna.'
                       : 'Pengguna baru yang mendaftar memperoleh peran dasar Operator dengan status menunggu aktivasi Administrator.'}

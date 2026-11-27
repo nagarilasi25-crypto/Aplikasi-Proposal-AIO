@@ -65,6 +65,7 @@ import {
   enqueueSyncMutationsToFirestore,
   processFirestoreSyncQueue,
   pullSnapshotFromFirestore,
+  resolveFirebaseAppUser,
   signInFirebaseWithGoogle,
   signOutFirebase,
 } from '../lib/firestoreSync';
@@ -343,6 +344,7 @@ interface AuthContextValue {
   authError: string | null;
   authNotice: string | null;
   clearAuthMessages: () => void;
+  signInWithFirebaseGoogle: () => Promise<void>;
   setupFirstAdmin: (
     username: string,
     displayName: string,
@@ -492,6 +494,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [authError, setAuthError] = useState<string | null>(null);
   const [authNotice, setAuthNotice] = useState<string | null>(null);
   const syncInFlightRef = useRef(false);
+  const appUserRef = useRef<AppUser | null>(null);
+  const sessionTokenRef = useRef<string | null>(null);
+  const pulledUidRef = useRef<string | null>(null);
+  const institutionRef = useRef<InstitutionProfile | null>(null);
+  const categoriesRef = useRef<ProposalCategory[]>([]);
+  const templatesRef = useRef<ProposalTemplate[]>([]);
+  const proposalsRef = useRef<ProposalRecord[]>([]);
+  const budgetsRef = useRef<ProposalBudget[]>([]);
+  const attachmentsRef = useRef<ProposalAttachment[]>([]);
+  const statusHistoryRef = useRef<ProposalStatusHistory[]>([]);
+
+  appUserRef.current = appUser;
+  sessionTokenRef.current = sessionToken;
+  institutionRef.current = institution;
+  categoriesRef.current = categories;
+  templatesRef.current = templates;
+  proposalsRef.current = proposals;
+  budgetsRef.current = budgets;
+  attachmentsRef.current = attachments;
+  statusHistoryRef.current = statusHistory;
 
   const firestoreConnected = Boolean(firebaseUser && firebaseUser.emailVerified);
   const pendingFirestoreCount = firestoreQueue.length;
@@ -524,7 +546,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }>(bootRes);
           if (parsed.ok && parsed.isJson && typeof parsed.data?.needsSetup === 'boolean') {
             serverReachable = true;
-            setNeedsSetup(parsed.data.needsSetup);
+            if (!appUserRef.current) {
+              setNeedsSetup(parsed.data.needsSetup);
+            }
             setHasEnvAdminPasscode(Boolean(parsed.data.hasEnvAdminPasscode));
           }
         } catch {
@@ -535,7 +559,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       if (!serverReachable) {
         const hasLocalAdmin = await hasActiveOfflineAdmin();
-        setNeedsSetup(!hasLocalAdmin);
+        if (!appUserRef.current) {
+          setNeedsSetup(!hasLocalAdmin);
+        }
         setHasEnvAdminPasscode(false);
       }
 
@@ -693,16 +719,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [appUser, isOfflineSession, isOnline, sessionToken]);
 
-  useEffect(() => {
-    if (typeof navigator !== 'undefined' && navigator.onLine) {
-      void testConnection();
-    }
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setFirebaseUser(user);
-    });
-    return () => unsubscribe();
-  }, []);
-
   const apiRequest = useCallback(
     async <T = unknown,>(
       url: string,
@@ -807,6 +823,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const activeToken = tokenOverride ?? sessionToken;
       setInstitutionLoading(true);
       try {
+        const [
+          cachedInst,
+          cachedProps,
+          cachedCats,
+          cachedTpls,
+          cachedBudgets,
+          cachedAtts,
+          cachedHist,
+          cachedSettings,
+          pendingApi,
+          pendingFs,
+        ] = await Promise.all([
+          getOfflineKV<InstitutionProfile>('institution'),
+          getOfflineKV<ProposalRecord[]>('proposals'),
+          getOfflineKV<ProposalCategory[]>('categories'),
+          getOfflineKV<ProposalTemplate[]>('templates'),
+          getOfflineKV<ProposalBudget[]>('budgets'),
+          getOfflineKV<ProposalAttachment[]>('attachments'),
+          getOfflineKV<ProposalStatusHistory[]>('statusHistory'),
+          getOfflineKV<SystemAppSettings>('appSettings'),
+          getOfflineMutationQueue(),
+          getFirestoreSyncQueue(),
+        ]);
+
         if (navigator.onLine && activeToken) {
           const data = await apiRequest<{
             institution: InstitutionProfile;
@@ -819,37 +859,116 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             appSettings?: SystemAppSettings;
           }>('/api/dashboard-data', { tokenOverride: activeToken });
 
-          // Preserve any locally queued institution draft until queue flush finishes
-          const pendingQueue = await getOfflineMutationQueue();
-          const hasPendingInst = pendingQueue.some((m) => m.endpoint === '/api/institution');
-          const cachedInst = hasPendingInst
-            ? await getOfflineKV<InstitutionProfile>('institution')
-            : null;
-          const effectiveInst = cachedInst || data.institution || EMPTY_INSTITUTION;
-          const effectiveCats = data.categories || [];
-          const effectiveTpls = data.templates || [];
-          const effectiveBudgets = data.budgets || [];
-          const effectiveAtts = data.attachments || [];
-          const effectiveHist = data.statusHistory || [];
-          const effectiveSettings = data.appSettings || DEFAULT_APP_SETTINGS;
+          // Re-read IndexedDB after network fetch so concurrent pullFromFirestore writes are never overwritten
+          const [
+            latestCachedInst,
+            latestCachedProps,
+            latestCachedCats,
+            latestCachedTpls,
+            latestCachedBudgets,
+            latestCachedAtts,
+            latestCachedHist,
+            latestCachedSettings,
+          ] = await Promise.all([
+            getOfflineKV<InstitutionProfile>('institution'),
+            getOfflineKV<ProposalRecord[]>('proposals'),
+            getOfflineKV<ProposalCategory[]>('categories'),
+            getOfflineKV<ProposalTemplate[]>('templates'),
+            getOfflineKV<ProposalBudget[]>('budgets'),
+            getOfflineKV<ProposalAttachment[]>('attachments'),
+            getOfflineKV<ProposalStatusHistory[]>('statusHistory'),
+            getOfflineKV<SystemAppSettings>('appSettings'),
+          ]);
+
+          const effectiveCachedInst = latestCachedInst || cachedInst;
+          const effectiveCachedProps = latestCachedProps || cachedProps;
+          const effectiveCachedCats = latestCachedCats || cachedCats;
+          const effectiveCachedTpls = latestCachedTpls || cachedTpls;
+          const effectiveCachedBudgets = latestCachedBudgets || cachedBudgets;
+          const effectiveCachedAtts = latestCachedAtts || cachedAtts;
+          const effectiveCachedHist = latestCachedHist || cachedHist;
+          const effectiveCachedSettings = latestCachedSettings || cachedSettings;
+
+          const hasPendingInst =
+            pendingApi.some((m) => m.endpoint === '/api/institution') ||
+            pendingFs.some((f) => f.collection === 'institutions');
+          const serverInstHasContent = Boolean(
+            data.institution &&
+              (data.institution.name ||
+                data.institution.address ||
+                data.institution.history ||
+                data.institution.leaderName)
+          );
+          const cachedInstHasContent = Boolean(
+            effectiveCachedInst &&
+              (effectiveCachedInst.name ||
+                effectiveCachedInst.address ||
+                effectiveCachedInst.history ||
+                effectiveCachedInst.leaderName)
+          );
+
+          const effectiveInst = hasPendingInst
+            ? effectiveCachedInst || data.institution || EMPTY_INSTITUTION
+            : serverInstHasContent
+            ? data.institution
+            : cachedInstHasContent
+            ? effectiveCachedInst!
+            : data.institution || EMPTY_INSTITUTION;
+
+          const mergeKeepExisting = <T extends { id: string }>(
+            localList: T[] | null | undefined,
+            serverList: T[] | undefined
+          ): T[] => {
+            const map = new Map<string, T>();
+            for (const item of localList || []) {
+              map.set(item.id, item);
+            }
+            for (const srvItem of serverList || []) {
+              map.set(srvItem.id, srvItem);
+            }
+            return Array.from(map.values());
+          };
+
+          const mergedProps = mergeKeepExisting(effectiveCachedProps, data.proposals);
+          mergedProps.sort((a, b) =>
+            String(b.updatedAt || b.createdAt || '').localeCompare(
+              String(a.updatedAt || a.createdAt || '')
+            )
+          );
+          const mergedCats = mergeKeepExisting(
+            effectiveCachedCats && effectiveCachedCats.length > 0
+              ? effectiveCachedCats
+              : createInitialCategories(),
+            data.categories
+          );
+          const mergedTpls = mergeKeepExisting(
+            effectiveCachedTpls && effectiveCachedTpls.length > 0
+              ? effectiveCachedTpls
+              : createInitialTemplates('system'),
+            data.templates
+          );
+          const mergedBudgets = mergeKeepExisting(effectiveCachedBudgets, data.budgets);
+          const mergedAtts = mergeKeepExisting(effectiveCachedAtts, data.attachments);
+          const mergedHist = mergeKeepExisting(effectiveCachedHist, data.statusHistory);
+          const effectiveSettings = data.appSettings || effectiveCachedSettings || DEFAULT_APP_SETTINGS;
 
           setInstitution(effectiveInst);
-          setProposals(data.proposals || []);
-          setCategories(effectiveCats);
-          setTemplates(effectiveTpls);
-          setBudgets(effectiveBudgets);
-          setAttachments(effectiveAtts);
-          setStatusHistory(effectiveHist);
+          setProposals(mergedProps);
+          setCategories(mergedCats);
+          setTemplates(mergedTpls);
+          setBudgets(mergedBudgets);
+          setAttachments(mergedAtts);
+          setStatusHistory(mergedHist);
           setAppSettings(effectiveSettings);
 
           await cacheDashboardSnapshot({
             institution: effectiveInst,
-            proposals: data.proposals || [],
-            categories: effectiveCats,
-            templates: effectiveTpls,
-            budgets: effectiveBudgets,
-            attachments: effectiveAtts,
-            statusHistory: effectiveHist,
+            proposals: mergedProps,
+            categories: mergedCats,
+            templates: mergedTpls,
+            budgets: mergedBudgets,
+            attachments: mergedAtts,
+            statusHistory: mergedHist,
             appSettings: effectiveSettings,
           });
         } else {
@@ -1944,22 +2063,104 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setLastFirestoreSyncReport([]);
   }, [refreshQueueCount]);
 
+  const exchangeFirebaseServerSession = useCallback(
+    async (
+      fbUser: FirebaseUser,
+      forceRefresh = false
+    ): Promise<{
+      token: string;
+      user: AppUser;
+      institution?: InstitutionProfile;
+    } | null> => {
+      if (!navigator.onLine) return null;
+      try {
+        const idToken = await fbUser.getIdToken(forceRefresh);
+        const res = await fetch('/api/auth/firebase-session', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({ idToken }),
+        });
+        const parsed = await parseJsonResponse<{
+          code?: string;
+          token?: string;
+          user?: AppUser;
+          institution?: InstitutionProfile;
+          error?: unknown;
+        }>(res);
+
+        if (parsed.isJson && (res.status === 403) && parsed.data?.user) {
+          setPendingStatusUser(parsed.data.user);
+          return null;
+        }
+
+        if (parsed.ok && parsed.isJson && parsed.data?.token && parsed.data?.user) {
+          setServerApiAvailable(true);
+          return {
+            token: parsed.data.token,
+            user: parsed.data.user,
+            institution: parsed.data.institution,
+          };
+        }
+        if (!parsed.isJson || res.status === 404 || res.status >= 500) {
+          setServerApiAvailable(false);
+        }
+      } catch {
+        // Ignore network errors and preserve client Firebase session
+      }
+      return null;
+    },
+    []
+  );
+
   const pullFromFirestore = useCallback(async () => {
     const pulled = await pullSnapshotFromFirestore();
-    const [pendingApi, pendingFs] = await Promise.all([
+    const [
+      pendingApi,
+      pendingFs,
+      cachedInst,
+      cachedCats,
+      cachedTpls,
+      cachedProps,
+      cachedBudgets,
+      cachedAtts,
+      cachedHist,
+    ] = await Promise.all([
       getOfflineMutationQueue(),
       getFirestoreSyncQueue(),
+      getOfflineKV<InstitutionProfile>('institution'),
+      getOfflineKV<ProposalCategory[]>('categories'),
+      getOfflineKV<ProposalTemplate[]>('templates'),
+      getOfflineKV<ProposalRecord[]>('proposals'),
+      getOfflineKV<ProposalBudget[]>('budgets'),
+      getOfflineKV<ProposalAttachment[]>('attachments'),
+      getOfflineKV<ProposalStatusHistory[]>('statusHistory'),
     ]);
 
     const pendingInst =
       pendingApi.some((m) => m.endpoint.startsWith('/api/institution')) ||
       pendingFs.some((f) => f.collection === 'institutions');
 
-    let nextInst = institution;
-    if (!pendingInst && pulled.institution) {
-      const mergedLogo = pulled.institution.logoUrl || institution?.logoUrl || '';
-      const mergedPhoto = pulled.institution.photoUrl || institution?.photoUrl || '';
-      nextInst = {
+    const baseInst = cachedInst || institutionRef.current;
+    const pulledInstHasData = Boolean(
+      pulled.institution &&
+        (pulled.institution.name ||
+          pulled.institution.address ||
+          pulled.institution.history ||
+          pulled.institution.leaderName ||
+          pulled.institution.phone ||
+          pulled.institution.email)
+    );
+    const localInstHasData = Boolean(
+      baseInst && (baseInst.name || baseInst.address || baseInst.history || baseInst.leaderName)
+    );
+
+    if (!pendingInst && pulled.institution && (pulledInstHasData || !localInstHasData)) {
+      const mergedLogo = pulled.institution.logoUrl || baseInst?.logoUrl || '';
+      const mergedPhoto = pulled.institution.photoUrl || baseInst?.photoUrl || '';
+      const nextInst: InstitutionProfile = {
         ...pulled.institution,
         logoUrl: mergedLogo,
         photoUrl: mergedPhoto,
@@ -2003,8 +2204,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
 
     if (pulled.categories.length > 0) {
+      const baseCats = categoriesRef.current.length > 0 ? categoriesRef.current : cachedCats || [];
       const merged = mergeById(
-        categories,
+        baseCats,
         pulled.categories,
         extractPendingIds('proposalCategories', '/api/categories')
       );
@@ -2013,8 +2215,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (pulled.templates.length > 0) {
+      const baseTpls = templatesRef.current.length > 0 ? templatesRef.current : cachedTpls || [];
       const merged = mergeById(
-        templates,
+        baseTpls,
         pulled.templates,
         extractPendingIds('proposalTemplates', '/api/templates')
       );
@@ -2023,8 +2226,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (pulled.proposals.length > 0) {
+      const baseProps = proposalsRef.current.length > 0 ? proposalsRef.current : cachedProps || [];
       const merged = mergeById(
-        proposals,
+        baseProps,
         pulled.proposals,
         extractPendingIds('proposals', '/api/proposals'),
         (localItem, cloudItem) => ({
@@ -2035,13 +2239,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             localItem?.attachmentIds?.length ? localItem.attachmentIds : cloudItem.attachmentIds,
         })
       );
+      merged.sort((a, b) =>
+        String(b.updatedAt || b.createdAt || '').localeCompare(
+          String(a.updatedAt || a.createdAt || '')
+        )
+      );
       setProposals(merged);
       await setOfflineKV('proposals', merged);
     }
 
     if (pulled.budgets.length > 0) {
+      const baseBudgets = budgetsRef.current.length > 0 ? budgetsRef.current : cachedBudgets || [];
       const merged = mergeById(
-        budgets,
+        baseBudgets,
         pulled.budgets,
         extractPendingIds('proposalBudgets', '/api/budgets')
       );
@@ -2050,8 +2260,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (pulled.attachments.length > 0) {
+      const baseAtts = attachmentsRef.current.length > 0 ? attachmentsRef.current : cachedAtts || [];
       const merged = mergeById(
-        attachments,
+        baseAtts,
         pulled.attachments,
         extractPendingIds('proposalAttachments', '/api/attachments'),
         (localItem, cloudItem) => ({
@@ -2067,17 +2278,122 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (pulled.statusHistory.length > 0) {
+      const baseHist = statusHistoryRef.current.length > 0 ? statusHistoryRef.current : cachedHist || [];
       const merged = mergeById(
-        statusHistory,
+        baseHist,
         pulled.statusHistory,
         new Set<string>()
+      );
+      merged.sort((a, b) =>
+        String(b.createdAt || '').localeCompare(String(a.createdAt || ''))
       );
       setStatusHistory(merged);
       await setOfflineKV('statusHistory', merged);
     }
 
     return { counts: pulled.counts };
-  }, [attachments, budgets, categories, institution, proposals, statusHistory, templates]);
+  }, []);
+
+  // Restore Firebase Auth state & auto-pull old Firestore data on login/refresh
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && navigator.onLine) {
+      void testConnection();
+    }
+    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+      setFirebaseUser(fbUser);
+      if (!fbUser || !fbUser.emailVerified) {
+        pulledUidRef.current = null;
+        return;
+      }
+
+      if (!navigator.onLine) {
+        return;
+      }
+
+      try {
+        // Restore appUser session automatically if user isn't logged into local session yet,
+        // or activate server session token silently if missing.
+        if (!appUserRef.current || !sessionTokenRef.current) {
+          const serverSession = await exchangeFirebaseServerSession(fbUser);
+          if (serverSession) {
+            setSessionToken(serverSession.token);
+            setIsOfflineSession(false);
+            setNeedsSetup(false);
+            if (!appUserRef.current) {
+              setAppUser(serverSession.user);
+              setPendingStatusUser(null);
+              saveStoredSession(serverSession.token, serverSession.user, false);
+            } else {
+              saveStoredSession(serverSession.token, appUserRef.current, false);
+            }
+          } else if (!appUserRef.current) {
+            const resolved = await resolveFirebaseAppUser(fbUser);
+            if (resolved.status === 'active') {
+              setAppUser(resolved);
+              setPendingStatusUser(null);
+              setNeedsSetup(false);
+              setIsOfflineSession(true);
+              saveStoredSession(null, resolved, true);
+            } else {
+              setPendingStatusUser(resolved);
+              return;
+            }
+          }
+        }
+
+        if (pulledUidRef.current !== fbUser.uid) {
+          pulledUidRef.current = fbUser.uid;
+          await pullFromFirestore();
+        }
+      } catch {
+        // Keep existing session state without crashing on background restore
+      }
+    });
+    return () => unsubscribe();
+  }, [exchangeFirebaseServerSession, pullFromFirestore]);
+
+  const signInWithFirebaseGoogle = useCallback(async () => {
+    setSigningIn(true);
+    setAuthError(null);
+    setAuthNotice(null);
+    try {
+      if (!navigator.onLine) {
+        throw new Error('Koneksi internet diperlukan untuk masuk dengan akun Google Firebase.');
+      }
+      const fbUser = await signInFirebaseWithGoogle();
+      setFirebaseUser(fbUser);
+
+      const resolvedUser = await resolveFirebaseAppUser(fbUser);
+      if (resolvedUser.status !== 'active') {
+        setPendingStatusUser(resolvedUser);
+        return;
+      }
+
+      const serverSession = await exchangeFirebaseServerSession(fbUser);
+      const activeUser = serverSession?.user || resolvedUser;
+      const activeToken = serverSession?.token || null;
+
+      saveStoredSession(activeToken, activeUser, !activeToken);
+      setSessionToken(activeToken);
+      setAppUser(activeUser);
+      setPendingStatusUser(null);
+      setIsOfflineSession(!activeToken);
+      setNeedsSetup(false);
+      setLastSyncError(null);
+
+      pulledUidRef.current = fbUser.uid;
+      await pullFromFirestore();
+      await refreshQueueCount();
+    } catch (err) {
+      setAuthError(
+        err instanceof Error
+          ? err.message
+          : 'Gagal masuk menggunakan akun Google Firebase.'
+      );
+    } finally {
+      setSigningIn(false);
+    }
+  }, [exchangeFirebaseServerSession, pullFromFirestore, refreshQueueCount]);
 
   const syncFirestoreNow = useCallback(async () => {
     await resetFailedFirestoreItems();
@@ -2149,27 +2465,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const user = await signInFirebaseWithGoogle();
     setFirebaseUser(user);
 
+    if (!sessionToken) {
+      const serverSession = await exchangeFirebaseServerSession(user);
+      if (serverSession?.token && appUser) {
+        setSessionToken(serverSession.token);
+        setIsOfflineSession(false);
+        saveStoredSession(serverSession.token, appUser, false);
+      }
+    }
+
     const skippedFromApi = await rescueApiQueueToFirestore();
     const existingQueue = await getFirestoreSyncQueue();
-    if (existingQueue.length === 0 && skippedFromApi.length === 0) {
-      await enqueueFullSnapshotToFirestore({
-        institution,
-        categories,
-        templates,
-        proposals,
-        budgets,
-        attachments,
-        statusHistory,
-      });
-      await refreshQueueCount();
-    }
 
     setFirestoreSyncing(true);
     try {
-      const res = await processFirestoreSyncQueue({
-        institutionFallback: institution,
-        onQueueChange: setFirestoreQueue,
-      });
+      let res: {
+        syncedCount: number;
+        failedCount: number;
+        lastError: string | null;
+        items: SyncItemReport[];
+      } = { syncedCount: 0, failedCount: 0, lastError: null, items: [] };
+
+      if (existingQueue.length > 0) {
+        res = await processFirestoreSyncQueue({
+          institutionFallback: institution,
+          onQueueChange: setFirestoreQueue,
+        });
+      }
+
+      pulledUidRef.current = user.uid;
+      await pullFromFirestore().catch(() => {});
+
       const combinedItems = [...res.items, ...skippedFromApi];
       setLastFirestoreSyncError(res.lastError);
       setLastFirestoreSyncReport(combinedItems);
@@ -2194,16 +2520,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setFirestoreSyncing(false);
     }
   }, [
-    attachments,
-    budgets,
-    categories,
+    appUser,
+    exchangeFirebaseServerSession,
     institution,
-    proposals,
+    pullFromFirestore,
     refreshQueueCount,
     rescueApiQueueToFirestore,
     serverApiAvailable,
-    statusHistory,
-    templates,
+    sessionToken,
   ]);
 
   const disconnectFirestoreCloud = useCallback(async () => {
@@ -2505,7 +2829,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!navigator.onLine) {
       throw new Error('Pembuatan narasi menggunakan AI memerlukan koneksi internet yang aktif.');
     }
-    if (!sessionToken) {
+
+    let activeToken = sessionToken;
+    if (!activeToken && auth.currentUser?.emailVerified) {
+      const refreshed = await exchangeFirebaseServerSession(auth.currentUser, false);
+      if (refreshed?.token) {
+        activeToken = refreshed.token;
+        setSessionToken(refreshed.token);
+        setIsOfflineSession(false);
+        if (appUser) {
+          saveStoredSession(refreshed.token, appUser, false);
+        }
+      }
+    }
+
+    if (!activeToken) {
       setReconnectModalOpen(true);
       throw new Error(
         'Sesi server belum aktif. Silakan masukkan kata sandi pada jendela penghubungan untuk mengaktifkan AI.'
@@ -2515,9 +2853,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return await apiRequest<AiNarrativeResponse>('/api/ai/generate-narrative', {
         method: 'POST',
         body: payload as unknown as Record<string, unknown>,
+        tokenOverride: activeToken,
       });
     } catch (err) {
       if (err instanceof AuthSessionError) {
+        if (auth.currentUser?.emailVerified) {
+          const refreshed = await exchangeFirebaseServerSession(auth.currentUser, true);
+          if (refreshed?.token) {
+            setSessionToken(refreshed.token);
+            setIsOfflineSession(false);
+            if (appUser) {
+              saveStoredSession(refreshed.token, appUser, false);
+            }
+            return await apiRequest<AiNarrativeResponse>('/api/ai/generate-narrative', {
+              method: 'POST',
+              body: payload as unknown as Record<string, unknown>,
+              tokenOverride: refreshed.token,
+            });
+          }
+        }
         downgradeToOfflineSession();
         setReconnectModalOpen(true);
         throw new Error(
@@ -3420,6 +3774,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signOutUser = () => {
     clearStoredSession();
     void setOfflineKV('swSyncToken', null);
+    pulledUidRef.current = null;
+    void signOutFirebase().catch(() => {});
+    setFirebaseUser(null);
     setSessionToken(null);
     setAppUser(null);
     setInstitution(null);
@@ -3500,6 +3857,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setAuthNotice(null);
           setPendingStatusUser(null);
         },
+        signInWithFirebaseGoogle,
         setupFirstAdmin,
         signInWithUsername,
         registerWithUsername,

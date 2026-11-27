@@ -32,6 +32,7 @@ import {
   updateFirestoreSyncItem,
 } from './offlineDb';
 import {
+  AppUser,
   BLUEPRINT_LIMITS,
   BOOTSTRAPPED_ADMIN_EMAIL,
   INSTITUTION_DOC_ID,
@@ -43,6 +44,8 @@ import {
   ProposalRecord,
   ProposalStatusHistory,
   ProposalTemplate,
+  UserRole,
+  UserStatus,
 } from '../types/models';
 import { sanitizeString } from './formatters';
 
@@ -276,6 +279,184 @@ export function buildStatusHistoryFirestorePayload(
   };
 }
 
+export async function resolveFirebaseAppUser(user: FirebaseUser): Promise<AppUser> {
+  if (!user.emailVerified) {
+    throw new Error('Akun Google belum terverifikasi emailnya.');
+  }
+
+  const userPath = `users/${user.uid}`;
+  const userRef = doc(db, 'users', user.uid);
+  let snap;
+  try {
+    snap = await getDoc(userRef);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, userPath);
+  }
+
+  const isBootstrap =
+    (user.email || '').toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
+
+  if (snap && snap.exists()) {
+    const d = snap.data();
+    const role: UserRole =
+      d.role === 'Administrator' || d.role === 'Pimpinan' || d.role === 'Operator'
+        ? d.role
+        : isBootstrap
+        ? 'Administrator'
+        : 'Operator';
+    const status: UserStatus =
+      d.status === 'active' || d.status === 'pending' || d.status === 'inactive'
+        ? d.status
+        : isBootstrap
+        ? 'active'
+        : 'pending';
+    const emailStr = String(d.email || user.email || '');
+    const derivedUsername = emailStr.includes('@')
+      ? emailStr.split('@')[0]
+      : String(d.uid || user.uid);
+    return {
+      uid: String(d.uid || user.uid),
+      username: derivedUsername,
+      displayName: String(d.displayName || user.displayName || emailStr || 'Pengguna'),
+      email: emailStr,
+      photoURL: String(d.photoURL || user.photoURL || ''),
+      phone: String(d.phone || ''),
+      position: String(
+        d.position || (role === 'Administrator' ? 'Administrator Sistem' : '')
+      ),
+      role,
+      status,
+      createdAt: timestampToIso(d.createdAt),
+      updatedAt: timestampToIso(d.updatedAt),
+      createdBy: String(d.createdBy || user.uid),
+      updatedBy: String(d.updatedBy || user.uid),
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+  const safeUid = sanitizeFirestoreId(user.uid, 'usr');
+  const emailStr = sanitizeString(user.email || 'user@arraudhah.local', 200);
+  const displayName =
+    sanitizeString(user.displayName || user.email || 'Pengguna', 150) || 'Pengguna';
+  const role: UserRole = isBootstrap ? 'Administrator' : 'Operator';
+  const status: UserStatus = isBootstrap ? 'active' : 'pending';
+  const position = isBootstrap ? 'Administrator Sistem' : 'Operator';
+
+  try {
+    await setDoc(userRef, {
+      uid: safeUid,
+      displayName,
+      email: emailStr,
+      photoURL: sanitizeOptionalUrl(user.photoURL, BLUEPRINT_LIMITS.user.photoURLMax),
+      phone: '',
+      position,
+      role,
+      status,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      createdBy: user.uid,
+      updatedBy: user.uid,
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, userPath);
+  }
+
+  return {
+    uid: safeUid,
+    username: emailStr.includes('@') ? emailStr.split('@')[0] : safeUid,
+    displayName,
+    email: emailStr,
+    photoURL: user.photoURL || '',
+    phone: '',
+    position,
+    role,
+    status,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    createdBy: user.uid,
+    updatedBy: user.uid,
+  };
+}
+
+export async function fetchAllFirestoreUsersForAdmin(): Promise<AppUser[]> {
+  const currentUser = auth.currentUser;
+  if (!currentUser || !currentUser.emailVerified) {
+    return [];
+  }
+  try {
+    const q = query(
+      collection(db, 'users'),
+      where('role', 'in', ['Administrator', 'Pimpinan', 'Operator'])
+    );
+    const snap = await getDocs(q);
+    return snap.docs.map((docSnap) => {
+      const d = docSnap.data();
+      const emailStr = String(d.email || '');
+      const role: UserRole =
+        d.role === 'Administrator' || d.role === 'Pimpinan' || d.role === 'Operator'
+          ? d.role
+          : 'Operator';
+      const status: UserStatus =
+        d.status === 'active' || d.status === 'pending' || d.status === 'inactive'
+          ? d.status
+          : 'pending';
+      return {
+        uid: String(d.uid || docSnap.id),
+        username: emailStr.includes('@') ? emailStr.split('@')[0] : docSnap.id,
+        displayName: String(d.displayName || emailStr || docSnap.id),
+        email: emailStr,
+        photoURL: String(d.photoURL || ''),
+        phone: String(d.phone || ''),
+        position: String(d.position || ''),
+        role,
+        status,
+        createdAt: timestampToIso(d.createdAt),
+        updatedAt: timestampToIso(d.updatedAt),
+        createdBy: String(d.createdBy || ''),
+        updatedBy: String(d.updatedBy || ''),
+      };
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, 'users');
+  }
+}
+
+export async function updateFirestoreUserForAdmin(
+  targetUid: string,
+  patch: {
+    displayName: string;
+    phone: string;
+    position: string;
+    role: UserRole;
+    status: UserStatus;
+  }
+): Promise<boolean> {
+  const currentUser = auth.currentUser;
+  if (!currentUser || !currentUser.emailVerified || !targetUid) {
+    return false;
+  }
+  const userPath = `users/${targetUid}`;
+  const userRef = doc(db, 'users', targetUid);
+  try {
+    const existingSnap = await getDoc(userRef);
+    if (!existingSnap.exists()) {
+      return false;
+    }
+    await updateDoc(userRef, {
+      displayName: sanitizeString(patch.displayName, BLUEPRINT_LIMITS.user.displayNameMax) || 'Pengguna',
+      phone: sanitizeString(patch.phone, BLUEPRINT_LIMITS.user.phoneMax),
+      position: sanitizeString(patch.position, BLUEPRINT_LIMITS.user.positionMax),
+      role: patch.role,
+      status: patch.status,
+      updatedAt: serverTimestamp(),
+      updatedBy: currentUser.uid,
+    });
+    return true;
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, userPath);
+  }
+}
+
 export async function signInFirebaseWithGoogle(): Promise<FirebaseUser> {
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: 'select_account' });
@@ -306,39 +487,7 @@ export async function signInFirebaseWithGoogle(): Promise<FirebaseUser> {
   }
 
   await testConnection();
-
-  const userPath = `users/${user.uid}`;
-  const userRef = doc(db, 'users', user.uid);
-  let snapExists = false;
-  try {
-    const snap = await getDoc(userRef);
-    snapExists = snap.exists();
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, userPath);
-  }
-
-  if (!snapExists) {
-    const isBootstrap =
-      (user.email || '').toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
-    try {
-      await setDoc(userRef, {
-        uid: sanitizeFirestoreId(user.uid, 'usr'),
-        displayName: sanitizeString(user.displayName || user.email || 'Pengguna', 150) || 'Pengguna',
-        email: sanitizeString(user.email || 'user@arraudhah.local', 200),
-        photoURL: sanitizeOptionalUrl(user.photoURL, BLUEPRINT_LIMITS.user.photoURLMax),
-        phone: '',
-        position: isBootstrap ? 'Administrator Sistem' : 'Operator',
-        role: isBootstrap ? 'Administrator' : 'Operator',
-        status: isBootstrap ? 'active' : 'pending',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-        createdBy: user.uid,
-        updatedBy: user.uid,
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, userPath);
-    }
-  }
+  await resolveFirebaseAppUser(user);
 
   return user;
 }
@@ -1207,6 +1356,15 @@ export async function pullSnapshotFromFirestore(): Promise<PulledFirestoreSnapsh
       createdAt: timestampToIso(d.createdAt),
     };
   });
+
+  proposals.sort((a, b) =>
+    String(b.updatedAt || b.createdAt || '').localeCompare(
+      String(a.updatedAt || a.createdAt || '')
+    )
+  );
+  statusHistory.sort((a, b) =>
+    String(b.createdAt || '').localeCompare(String(a.createdAt || ''))
+  );
 
   return {
     institution,
