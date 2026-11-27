@@ -9,6 +9,10 @@ export function ReconnectModal() {
     reconnectModalOpen,
     closeReconnectModal,
     openCloudSyncModal,
+    serverApiAvailable,
+    firestoreConnected,
+    connectFirestoreCloud,
+    syncFirestoreNow,
     pendingSyncCount,
     lastSyncError,
     reconnectServerSession,
@@ -34,6 +38,33 @@ export function ReconnectModal() {
   }, [reconnectModalOpen]);
 
   if (!reconnectModalOpen || !appUser) return null;
+
+  const handleDirectFirestoreSync = async () => {
+    setSubmitting(true);
+    setErrorMsg(null);
+    try {
+      const res = firestoreConnected
+        ? await syncFirestoreNow()
+        : await connectFirestoreCloud();
+      if (res.failedCount > 0 && res.lastError) {
+        setErrorMsg(res.lastError);
+      } else {
+        showToast(
+          res.syncedCount > 0
+            ? `${res.syncedCount} perubahan berhasil disinkronkan ke Cloud Firestore!`
+            : 'Seluruh data berhasil disinkronkan ke Cloud Firestore!',
+          'success'
+        );
+        closeReconnectModal();
+      }
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Gagal menyinkronkan ke Cloud Firestore.'
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -100,9 +131,10 @@ export function ReconnectModal() {
 
   const displayedError = errorMsg || lastSyncError;
   const showCloudFallbackBtn = Boolean(
-    displayedError &&
-      (displayedError.includes('Cloud Firestore') ||
-        displayedError.includes('Server backend (/api)'))
+    !serverApiAvailable ||
+      (displayedError &&
+        (displayedError.includes('Cloud Firestore') ||
+          displayedError.includes('Server backend (/api)')))
   );
 
   return (
@@ -134,33 +166,70 @@ export function ReconnectModal() {
         </div>
 
         <div className="mt-4 space-y-3">
-          <p className="text-xs leading-relaxed text-slate-600">
-            Saat ini aplikasi berjalan dengan sesi lokal. Masukkan kata sandi akun Anda untuk
-            mengaktifkan sesi server agar{' '}
-            {pendingSyncCount > 0 ? (
-              <strong className="text-[#0F3D2E]">
-                {pendingSyncCount} perubahan tertunda langsung tersinkronisasi
-              </strong>
-            ) : (
-              'sinkronisasi otomatis'
-            )}{' '}
-            dan fitur <strong className="text-[#0F3D2E]">Narasi AI</strong> dapat berjalan.
-          </p>
-
-          {displayedError && (
-            <div className="space-y-2 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-700">
-              <p>{displayedError}</p>
-              {showCloudFallbackBtn && (
+          {!serverApiAvailable ? (
+            <div className="space-y-3 rounded-lg border border-emerald-200 bg-emerald-50/70 p-3.5 text-xs text-emerald-950">
+              <p className="leading-relaxed">
+                Alamat aplikasi ini berjalan tanpa server API lokal. Sinkronisasi data dilakukan langsung melalui{' '}
+                <strong className="text-[#0F3D2E]">Cloud Firestore</strong>
+                {pendingSyncCount > 0
+                  ? ` (${pendingSyncCount} perubahan lokal siap dikirim).`
+                  : '.'}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleDirectFirestoreSync}
+                  disabled={submitting}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-[#0F3D2E] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#144D3A] disabled:opacity-60"
+                >
+                  <Cloud className="h-3.5 w-3.5" />
+                  {submitting
+                    ? 'Menyinkronkan...'
+                    : firestoreConnected
+                    ? 'Sinkronkan ke Cloud Firestore'
+                    : 'Hubungkan Google & Sinkronkan'}
+                </button>
                 <button
                   type="button"
                   onClick={() => {
                     closeReconnectModal();
                     openCloudSyncModal();
                   }}
-                  className="inline-flex items-center gap-1.5 rounded-md bg-[#0F3D2E] px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-[#144D3A]"
+                  className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-medium text-[#0F3D2E] hover:bg-emerald-50"
+                >
+                  Lihat Antrean Cloud
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="text-xs leading-relaxed text-slate-600">
+              Saat ini aplikasi berjalan dengan sesi lokal. Masukkan kata sandi akun Anda untuk
+              mengaktifkan sesi server agar{' '}
+              {pendingSyncCount > 0 ? (
+                <strong className="text-[#0F3D2E]">
+                  {pendingSyncCount} perubahan tertunda langsung tersinkronisasi
+                </strong>
+              ) : (
+                'sinkronisasi otomatis'
+              )}{' '}
+              dan fitur <strong className="text-[#0F3D2E]">Narasi AI</strong> dapat berjalan.
+            </p>
+          )}
+
+          {displayedError && (
+            <div className="space-y-2 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-700">
+              <p>{displayedError}</p>
+              {showCloudFallbackBtn && serverApiAvailable && (
+                <button
+                  type="button"
+                  onClick={handleDirectFirestoreSync}
+                  disabled={submitting}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-[#0F3D2E] px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-[#144D3A] disabled:opacity-60"
                 >
                   <Cloud className="h-3.5 w-3.5" />
-                  Buka Sinkronisasi Cloud Firestore
+                  {firestoreConnected
+                    ? 'Sinkronkan ke Cloud Firestore Sekarang'
+                    : 'Hubungkan & Sinkronkan via Cloud Firestore'}
                 </button>
               )}
             </div>

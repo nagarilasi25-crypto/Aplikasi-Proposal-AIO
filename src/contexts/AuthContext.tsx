@@ -893,12 +893,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         onQueueChange: setFirestoreQueue,
       });
       setLastFirestoreSyncError(res.lastError);
+      if (res.failedCount === 0 && !serverApiAvailable) {
+        const remainingApi = await getOfflineMutationQueue();
+        if (remainingApi.length > 0) {
+          await clearOfflineMutationQueue();
+          setLastSyncError(null);
+          await refreshQueueCount();
+        }
+      }
       return res;
     } finally {
       setFirestoreQueue(await getFirestoreSyncQueue());
       setFirestoreSyncing(false);
     }
-  }, [institution]);
+  }, [institution, refreshQueueCount, serverApiAvailable]);
 
   // Flush queued offline mutations automatically when internet & session token are available
   useEffect(() => {
