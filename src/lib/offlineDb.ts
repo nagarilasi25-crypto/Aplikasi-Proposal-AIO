@@ -29,6 +29,65 @@ export interface OfflineSyncMutation {
   method: 'PUT' | 'PATCH' | 'POST' | 'DELETE';
   body: Record<string, unknown>;
   createdAt: string;
+  retryCount?: number;
+  lastError?: string | null;
+}
+
+export interface SyncItemReport {
+  id: string;
+  label: string;
+  target: 'server' | 'firestore';
+  status: 'synced' | 'failed' | 'skipped';
+  error?: string;
+}
+
+export function describeOfflineMutation(mut: OfflineSyncMutation): string {
+  const body = (mut.body || {}) as Record<string, unknown>;
+  if (mut.endpoint === '/api/institution' || mut.endpoint === '/api/institution/upload') {
+    const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : 'Ar-Raudhah';
+    return `Profil Lembaga (${name})`;
+  }
+  if (mut.endpoint.startsWith('/api/categories')) {
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    return mut.method === 'DELETE'
+      ? `Hapus Kategori (${mut.endpoint.split('/').pop() || ''})`
+      : `Kategori${name ? `: ${name}` : ''}`;
+  }
+  if (mut.endpoint.startsWith('/api/templates')) {
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    return mut.method === 'DELETE'
+      ? `Hapus Template (${mut.endpoint.split('/').pop() || ''})`
+      : `Template${name ? `: ${name}` : ''}`;
+  }
+  if (/^\/api\/proposals\/[^/]+\/status$/.test(mut.endpoint)) {
+    const st = typeof body.status === 'string' ? body.status : '';
+    return `Perubahan Status Proposal${st ? ` -> ${st}` : ''}`;
+  }
+  if (mut.endpoint.startsWith('/api/proposals')) {
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    return mut.method === 'DELETE'
+      ? `Hapus Proposal (${mut.endpoint.split('/').pop() || ''})`
+      : `Proposal${title ? `: ${title}` : ''}`;
+  }
+  if (mut.endpoint.startsWith('/api/budgets')) {
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    return mut.method === 'DELETE'
+      ? `Hapus RAB (${mut.endpoint.split('/').pop() || ''})`
+      : `RAB${title ? `: ${title}` : ''}`;
+  }
+  if (mut.endpoint.startsWith('/api/attachments')) {
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    return mut.method === 'DELETE'
+      ? `Hapus Lampiran (${mut.endpoint.split('/').pop() || ''})`
+      : `Lampiran${title ? `: ${title}` : ''}`;
+  }
+  if (mut.endpoint === '/api/settings/app') {
+    return 'Pengaturan Penomoran & Dokumen';
+  }
+  if (mut.endpoint === '/api/auth/me') {
+    return 'Profil Akun Pengguna';
+  }
+  return `${mut.method} ${mut.endpoint}`;
 }
 
 export type FirestoreSyncCollection =
@@ -587,6 +646,31 @@ export async function removeOfflineMutation(id: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction('syncQueue', 'readwrite');
     tx.objectStore('syncQueue').delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function updateOfflineMutationStatus(
+  id: string,
+  patch: Partial<Pick<OfflineSyncMutation, 'retryCount' | 'lastError'>>
+): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const db = await openOfflineDb();
+  const existing = await new Promise<OfflineSyncMutation | undefined>((resolve, reject) => {
+    const tx = db.transaction('syncQueue', 'readonly');
+    const req = tx.objectStore('syncQueue').get(id);
+    req.onsuccess = () => resolve(req.result as OfflineSyncMutation | undefined);
+    req.onerror = () => reject(req.error);
+  });
+  if (!existing) return;
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction('syncQueue', 'readwrite');
+    tx.objectStore('syncQueue').put({
+      ...existing,
+      ...patch,
+    });
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

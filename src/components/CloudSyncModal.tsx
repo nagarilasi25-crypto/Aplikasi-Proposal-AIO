@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   Cloud,
   CloudOff,
+  DownloadCloud,
   LogOut,
   RefreshCw,
   Trash2,
@@ -12,6 +13,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
+import { describeOfflineMutation } from '../lib/offlineDb';
 import { useToast } from './Toast';
 
 const COLLECTION_LABELS: Record<string, string> = {
@@ -35,20 +37,23 @@ export function CloudSyncModal() {
     pendingFirestoreCount,
     firestoreSyncing,
     lastFirestoreSyncError,
+    lastFirestoreSyncReport,
     pendingSyncCount,
+    pendingSyncItems,
     syncing,
     serverApiAvailable,
     hasServerSession,
     connectFirestoreCloud,
     disconnectFirestoreCloud,
     syncFirestoreNow,
+    pullFromFirestore,
     pushAllLocalToFirestore,
     clearFirestoreQueue,
     syncNow,
   } = useAuth();
   const isOnline = useOnlineStatus();
   const { showToast } = useToast();
-  const [busyAction, setBusyAction] = useState<'connect' | 'push' | 'sync' | null>(null);
+  const [busyAction, setBusyAction] = useState<'connect' | 'push' | 'pull' | 'sync' | null>(null);
 
   if (!cloudSyncModalOpen) return null;
 
@@ -118,6 +123,24 @@ export function CloudSyncModal() {
     }
   };
 
+  const handlePullFromFirestore = async () => {
+    setBusyAction('pull');
+    try {
+      const { counts } = await pullFromFirestore();
+      showToast(
+        `Berhasil membaca Firestore: ${counts.proposals} proposal, ${counts.budgets} RAB, ${counts.categories} kategori, ${counts.templates} template, ${counts.archives} arsip.`,
+        'success'
+      );
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : 'Gagal membaca data dari Cloud Firestore.',
+        'error'
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const handleDisconnect = async () => {
     await disconnectFirestoreCloud();
     showToast('Sesi sinkronisasi Firestore diputuskan (akun lokal tetap aktif).', 'info');
@@ -130,7 +153,7 @@ export function CloudSyncModal() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <div className="w-full max-w-xl rounded-xl bg-white shadow-2xl">
+      <div className="max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-xl bg-white shadow-2xl">
         <div className="flex items-start justify-between gap-3 border-b border-slate-100 px-6 py-4">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#0F3D2E] text-white">
@@ -220,6 +243,30 @@ export function CloudSyncModal() {
             </div>
           )}
 
+          {pendingSyncItems.length > 0 && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-3.5">
+              <p className="text-xs font-semibold text-amber-950">
+                Perubahan Lokal Tertunda ({pendingSyncItems.length})
+              </p>
+              <p className="mt-0.5 text-[11px] text-amber-900/80">
+                Data berikut tersimpan aman di perangkat dan ikut diselamatkan saat sinkronisasi Firestore atau Server dijalankan.
+              </p>
+              <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto text-[11px]">
+                {pendingSyncItems.map((mut) => (
+                  <li
+                    key={mut.id}
+                    className="flex items-center justify-between gap-2 rounded bg-white/90 px-2.5 py-1 text-[#111C18]"
+                  >
+                    <span className="truncate font-medium">{describeOfflineMutation(mut)}</span>
+                    <span className="shrink-0 font-mono text-[10px] text-slate-500">
+                      {mut.method}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {/* Queue List */}
           <div>
             <div className="flex items-center justify-between">
@@ -287,18 +334,68 @@ export function CloudSyncModal() {
               </div>
             )}
           </div>
+
+          {lastFirestoreSyncReport.length > 0 && (
+            <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3.5">
+              <p className="text-xs font-semibold text-[#111C18]">
+                Laporan Hasil Sinkronisasi Cloud ({lastFirestoreSyncReport.length} item)
+              </p>
+              <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto text-[11px]">
+                {lastFirestoreSyncReport.map((rep) => (
+                  <li key={`${rep.target}_${rep.id}`} className="flex items-start gap-1.5">
+                    {rep.status === 'synced' ? (
+                      <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                    ) : (
+                      <AlertCircle
+                        className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${
+                          rep.status === 'skipped' ? 'text-amber-600' : 'text-red-600'
+                        }`}
+                      />
+                    )}
+                    <span
+                      className={
+                        rep.status === 'synced'
+                          ? 'text-emerald-800'
+                          : rep.status === 'skipped'
+                          ? 'text-amber-800'
+                          : 'text-red-700'
+                      }
+                    >
+                      {rep.label}
+                      {rep.error
+                        ? ` — ${rep.error}`
+                        : rep.status === 'synced'
+                        ? ' (Berhasil)'
+                        : ''}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-6 py-4">
-          <button
-            type="button"
-            onClick={handlePushAll}
-            disabled={!isOnline || !firestoreConnected || firestoreSyncing || busyAction !== null}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-          >
-            <UploadCloud className="h-3.5 w-3.5" />
-            {busyAction === 'push' ? 'Mengirim Semua...' : 'Push Semua Data ke Firestore'}
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handlePushAll}
+              disabled={!isOnline || !firestoreConnected || firestoreSyncing || busyAction !== null}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+            >
+              <UploadCloud className="h-3.5 w-3.5" />
+              {busyAction === 'push' ? 'Mengirim...' : 'Push ke Firestore'}
+            </button>
+            <button
+              type="button"
+              onClick={handlePullFromFirestore}
+              disabled={!isOnline || !firestoreConnected || firestoreSyncing || busyAction !== null}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-[#0F3D2E] hover:bg-slate-50 disabled:opacity-50"
+            >
+              <DownloadCloud className="h-3.5 w-3.5" />
+              {busyAction === 'pull' ? 'Membaca...' : 'Tarik dari Firestore'}
+            </button>
+          </div>
 
           <div className="flex items-center gap-2">
             <button

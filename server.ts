@@ -1438,11 +1438,31 @@ async function startServer() {
   });
 
   // 8a. Server-Side Gemini AI Narrative Generation
+  const parseModelJson = <T,>(rawText: string): T => {
+    const cleaned = rawText
+      .trim()
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
+    return JSON.parse(cleaned) as T;
+  };
+
+  app.get('/api/ai/status', requireAuth, (_req, res) => {
+    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+    const configured = Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY');
+    res.json({
+      configured,
+      model: 'gemini-4-hydrogen',
+    });
+  });
+
   app.post('/api/ai/generate-narrative', requireAuth, async (req: AuthedRequest, res) => {
     const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-    if (!apiKey) {
+    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
       res.status(503).json({
-        error: 'Kunci API Gemini (GEMINI_API_KEY) belum dikonfigurasi pada server.',
+        error:
+          'Kunci API Gemini (GEMINI_API_KEY) belum dikonfigurasi pada server. Atur variabel GEMINI_API_KEY di panel Secrets / environment server lalu muat ulang server.',
       });
       return;
     }
@@ -1592,7 +1612,7 @@ ATURAN KETAT:
           res.status(502).json({ error: 'Model AI tidak mengembalikan teks narasi.' });
           return;
         }
-        const parsedJson = JSON.parse(rawText) as Record<string, string>;
+        const parsedJson = parseModelJson<Record<string, string>>(rawText);
 
         appendAudit(store, {
           action: 'AI_NARRATIVE_INSTITUTION',
@@ -1690,9 +1710,9 @@ ATURAN KETAT:
           res.status(502).json({ error: 'Model AI tidak mengembalikan draf bab proposal.' });
           return;
         }
-        const parsed = JSON.parse(rawText) as {
+        const parsed = parseModelJson<{
           sections?: Array<{ key: string; content: string }>;
-        };
+        }>(rawText);
         const mapObj: Record<string, string> = {};
         for (const item of parsed.sections || []) {
           if (item.key && typeof item.content === 'string') {
@@ -1832,19 +1852,41 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
       res.status(403).json({ error: 'Peran Anda tidak diizinkan mengubah kategori proposal.' });
       return;
     }
-    const id = req.params.id;
-    const store = readStore();
-    const idx = store.proposalCategories.findIndex((c) => c.id === id);
-    if (idx === -1) {
-      res.status(404).json({ error: 'Kategori tidak ditemukan.' });
-      return;
-    }
+    const id = sanitizeStr(req.params.id, 80);
     const name = sanitizeStr(req.body?.name, 120);
     if (!name) {
       res.status(400).json({ error: 'Nama kategori wajib diisi.' });
       return;
     }
+    const store = readStore();
+    const idx = store.proposalCategories.findIndex((c) => c.id === id);
     const now = new Date().toISOString();
+
+    if (idx === -1) {
+      const created = {
+        id: id || `cat_${crypto.randomUUID()}`,
+        institutionId: 'ar-raudhah',
+        name,
+        code: sanitizeStr(req.body?.code, 12).toUpperCase() || name.slice(0, 3).toUpperCase(),
+        description: sanitizeStr(req.body?.description, 500),
+        isActive: req.body?.isActive !== false,
+        createdAt: sanitizeStr(req.body?.createdAt, 40) || now,
+        updatedAt: now,
+      };
+      store.proposalCategories.push(created);
+      appendAudit(store, {
+        action: 'CATEGORY_UPSERT',
+        entityType: 'proposalCategories',
+        entityId: created.id,
+        actorUid: actor.uid,
+        actorName: actor.displayName,
+        details: `Menyinkronkan kategori proposal: ${name}.`,
+      });
+      writeStore(store);
+      res.json({ category: created });
+      return;
+    }
+
     const updated = {
       ...store.proposalCategories[idx],
       name,
@@ -1965,21 +2007,20 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
       res.status(403).json({ error: 'Peran Anda tidak diizinkan mengubah template.' });
       return;
     }
-    const id = req.params.id;
-    const store = readStore();
-    const idx = store.proposalTemplates.findIndex((t) => t.id === id);
-    if (idx === -1) {
-      res.status(404).json({ error: 'Template tidak ditemukan.' });
-      return;
-    }
+    const id = sanitizeStr(req.params.id, 80);
     const name = sanitizeStr(req.body?.name, 160);
     if (!name) {
       res.status(400).json({ error: 'Nama template wajib diisi.' });
       return;
     }
+    const store = readStore();
+    const idx = store.proposalTemplates.findIndex((t) => t.id === id);
+    const existingTpl = idx !== -1 ? store.proposalTemplates[idx] : null;
     const rawSections = Array.isArray(req.body?.sections)
       ? req.body.sections
-      : (store.proposalTemplates[idx].sections as Array<Record<string, unknown>>) || [];
+      : existingTpl && Array.isArray(existingTpl.sections)
+      ? (existingTpl.sections as Array<Record<string, unknown>>)
+      : [];
     const sections = rawSections.map((sec: Record<string, unknown>, i: number) => ({
       id: sanitizeStr(sec.id, 80) || `sec_${crypto.randomUUID()}`,
       key: sanitizeStr(sec.key, 60) || `bab_${i + 1}`,
@@ -1992,13 +2033,42 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
     }));
 
     const now = new Date().toISOString();
+    if (!existingTpl) {
+      const created = {
+        id: id || `tpl_${crypto.randomUUID()}`,
+        institutionId: 'ar-raudhah',
+        name,
+        proposalType: sanitizeStr(req.body?.proposalType, 100) || 'Umum',
+        description: sanitizeStr(req.body?.description, 600),
+        sections,
+        isDefault: Boolean(req.body?.isDefault),
+        isActive: req.body?.isActive !== false,
+        createdAt: sanitizeStr(req.body?.createdAt, 40) || now,
+        updatedAt: now,
+        createdBy: actor.uid,
+        updatedBy: actor.uid,
+      };
+      store.proposalTemplates.push(created);
+      appendAudit(store, {
+        action: 'TEMPLATE_UPSERT',
+        entityType: 'proposalTemplates',
+        entityId: created.id,
+        actorUid: actor.uid,
+        actorName: actor.displayName,
+        details: `Menyinkronkan template proposal: ${name}.`,
+      });
+      writeStore(store);
+      res.json({ template: created });
+      return;
+    }
+
     const updated = {
-      ...store.proposalTemplates[idx],
+      ...existingTpl,
       name,
-      proposalType: sanitizeStr(req.body?.proposalType, 100) || String(store.proposalTemplates[idx].proposalType || 'Umum'),
+      proposalType: sanitizeStr(req.body?.proposalType, 100) || String(existingTpl.proposalType || 'Umum'),
       description: sanitizeStr(req.body?.description, 600),
       sections,
-      isActive: typeof req.body?.isActive === 'boolean' ? req.body.isActive : Boolean(store.proposalTemplates[idx].isActive),
+      isActive: typeof req.body?.isActive === 'boolean' ? req.body.isActive : Boolean(existingTpl.isActive),
       updatedAt: now,
       updatedBy: actor.uid,
     };
@@ -2204,16 +2274,12 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
       res.status(403).json({ error: 'Peran Anda tidak diizinkan menyunting proposal.' });
       return;
     }
-    const id = req.params.id;
+    const id = sanitizeStr(req.params.id, 80);
     const store = readStore();
     const idx = store.proposals.findIndex((p) => p.id === id);
-    if (idx === -1) {
-      res.status(404).json({ error: 'Proposal tidak ditemukan.' });
-      return;
-    }
-    const existing = store.proposals[idx];
+    const existing = idx !== -1 ? store.proposals[idx] : null;
     const body = req.body || {};
-    const title = sanitizeStr(body.title, 300) || String(existing.title || '');
+    const title = sanitizeStr(body.title, 300) || (existing ? String(existing.title || '') : '');
     if (!title) {
       res.status(400).json({ error: 'Judul proposal wajib diisi.' });
       return;
@@ -2222,7 +2288,7 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
     const now = new Date().toISOString();
     const rawSections = Array.isArray(body.sections)
       ? body.sections
-      : Array.isArray(existing.sections)
+      : existing && Array.isArray(existing.sections)
       ? existing.sections
       : [];
     const sections = rawSections.map((sec: Record<string, unknown>, i: number) => ({
@@ -2240,7 +2306,72 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
       ? Number(linkedBudget.totalAmount) || 0
       : typeof body.totalBudget === 'number'
       ? sanitizeNum(body.totalBudget, 0, 100_000_000_000)
-      : Number(existing.totalBudget) || 0;
+      : existing
+      ? Number(existing.totalBudget) || 0
+      : 0;
+
+    if (!existing) {
+      const status = VALID_PROPOSAL_STATUSES.includes(body.status) ? body.status : 'Draft';
+      const created = {
+        id: id || `prop_${crypto.randomUUID()}`,
+        institutionId: 'ar-raudhah',
+        proposalNumber: sanitizeStr(body.proposalNumber, 120),
+        proposalDate: sanitizeStr(body.proposalDate, 30) || now.slice(0, 10),
+        fiscalYear: sanitizeNum(body.fiscalYear, 2000, 2100) || store.appSettings.defaultFiscalYear,
+        title,
+        categoryId: sanitizeStr(body.categoryId, 80),
+        categoryName: sanitizeStr(body.categoryName, 120),
+        templateId: sanitizeStr(body.templateId, 80),
+        proposalType: sanitizeStr(body.proposalType, 120),
+        recipientName: sanitizeStr(body.recipientName, 150),
+        recipientInstitution: sanitizeStr(body.recipientInstitution, 200),
+        recipientAddress: sanitizeStr(body.recipientAddress, 400),
+        location: sanitizeStr(body.location, 250),
+        executionTime: sanitizeStr(body.executionTime, 150),
+        summary: sanitizeStr(body.summary, 2000),
+        sections,
+        attachmentIds: Array.isArray(body.attachmentIds)
+          ? body.attachmentIds.map((v: unknown) => sanitizeStr(v, 80)).filter(Boolean)
+          : [],
+        isArchived: Boolean(body.isArchived),
+        archivedAt: body.isArchived ? sanitizeStr(body.archivedAt, 40) || now : '',
+        status,
+        totalBudget,
+        approvedAmount: sanitizeNum(body.approvedAmount, 0, 100_000_000_000),
+        receivedAmount: sanitizeNum(body.receivedAmount, 0, 100_000_000_000),
+        submittedAt: sanitizeStr(body.submittedAt, 40),
+        approvedAt: sanitizeStr(body.approvedAt, 40),
+        rejectedReason: sanitizeStr(body.rejectedReason, 1000),
+        followUpNotes: sanitizeStr(body.followUpNotes, 2000),
+        createdAt: sanitizeStr(body.createdAt, 40) || now,
+        updatedAt: now,
+        createdBy: actor.uid,
+        updatedBy: actor.uid,
+      };
+      store.proposals.unshift(created);
+      store.proposalStatusHistory.unshift({
+        id: `hist_${crypto.randomUUID()}`,
+        institutionId: 'ar-raudhah',
+        proposalId: created.id,
+        proposalTitle: title,
+        toStatus: status,
+        notes: 'Proposal disinkronkan dari penyimpanan lokal.',
+        actorUid: actor.uid,
+        actorName: actor.displayName,
+        createdAt: now,
+      });
+      appendAudit(store, {
+        action: 'PROPOSAL_UPSERT',
+        entityType: 'proposals',
+        entityId: created.id,
+        actorUid: actor.uid,
+        actorName: actor.displayName,
+        details: `Menyinkronkan proposal "${title}".`,
+      });
+      writeStore(store);
+      res.json({ proposal: created });
+      return;
+    }
 
     const nextArchived =
       typeof body.isArchived === 'boolean' ? body.isArchived : Boolean(existing.isArchived);
@@ -2604,35 +2735,53 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
       res.status(403).json({ error: 'Peran Anda tidak diizinkan mengubah RAB.' });
       return;
     }
-    const id = req.params.id;
+    const id = sanitizeStr(req.params.id, 80);
     const store = readStore();
-    const idx = store.proposalBudgets.findIndex((b) => b.id === id);
-    if (idx === -1) {
-      res.status(404).json({ error: 'Data RAB tidak ditemukan.' });
+    const body = req.body || {};
+    let idx = store.proposalBudgets.findIndex((b) => b.id === id);
+    if (idx === -1 && typeof body.proposalId === 'string' && body.proposalId) {
+      idx = store.proposalBudgets.findIndex((b) => b.proposalId === body.proposalId);
+    }
+    const existing = idx !== -1 ? store.proposalBudgets[idx] : null;
+    const proposalId =
+      sanitizeStr(body.proposalId, 80) || (existing ? String(existing.proposalId || '') : '');
+    if (!proposalId) {
+      res.status(400).json({ error: 'RAB harus dihubungkan ke salah satu proposal.' });
       return;
     }
-    const existing = store.proposalBudgets[idx];
-    const body = req.body || {};
-    const proposalId = sanitizeStr(body.proposalId, 80) || String(existing.proposalId || '');
+
     const { items, totalAmount } = normalizeRabItems(body.items);
     const linkedProposalIdx = store.proposals.findIndex((p) => p.id === proposalId);
     const now = new Date().toISOString();
+    const proposalTitle =
+      linkedProposalIdx !== -1
+        ? String(store.proposals[linkedProposalIdx].title || '')
+        : existing
+        ? String(existing.proposalTitle || '')
+        : sanitizeStr(body.proposalTitle, 300);
 
     const updated = {
-      ...existing,
+      id: existing ? String(existing.id) : id || `rab_${crypto.randomUUID()}`,
+      institutionId: 'ar-raudhah',
       proposalId,
-      proposalTitle:
-        linkedProposalIdx !== -1
-          ? String(store.proposals[linkedProposalIdx].title || '')
-          : String(existing.proposalTitle || ''),
-      title: sanitizeStr(body.title, 200) || String(existing.title || ''),
+      proposalTitle,
+      title:
+        sanitizeStr(body.title, 200) ||
+        (existing ? String(existing.title || '') : `RAB - ${proposalTitle || 'Proposal'}`),
       notes: sanitizeStr(body.notes, 1000),
       items,
       totalAmount,
+      createdAt: existing ? String(existing.createdAt || now) : sanitizeStr(body.createdAt, 40) || now,
       updatedAt: now,
+      createdBy: existing ? String(existing.createdBy || actor.uid) : actor.uid,
       updatedBy: actor.uid,
     };
-    store.proposalBudgets[idx] = updated;
+
+    if (idx !== -1) {
+      store.proposalBudgets[idx] = updated;
+    } else {
+      store.proposalBudgets.unshift(updated);
+    }
 
     if (linkedProposalIdx !== -1) {
       store.proposals[linkedProposalIdx] = {
@@ -2644,12 +2793,12 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
     }
 
     appendAudit(store, {
-      action: 'BUDGET_UPDATE',
+      action: existing ? 'BUDGET_UPDATE' : 'BUDGET_UPSERT',
       entityType: 'proposalBudgets',
-      entityId: id,
+      entityId: updated.id,
       actorUid: actor.uid,
       actorName: actor.displayName,
-      details: `Memperbarui RAB "${updated.title}" total Rp ${totalAmount.toLocaleString('id-ID')}.`,
+      details: `Menyimpan RAB "${updated.title}" total Rp ${totalAmount.toLocaleString('id-ID')}.`,
     });
     writeStore(store);
     res.json({ budget: updated });
@@ -2735,10 +2884,18 @@ ATURAN: Jangan memakai format markdown (** atau ##), dan jangan mengarang nomor 
     }
 
     const store = readStore();
+    const reqAttId = sanitizeStr(body.id, 80);
+    if (reqAttId) {
+      const existingAtt = store.proposalAttachments.find((a) => a.id === reqAttId);
+      if (existingAtt) {
+        res.status(200).json({ attachment: existingAtt });
+        return;
+      }
+    }
     const proposalId = sanitizeStr(body.proposalId, 80);
     const linkedProp = proposalId ? store.proposals.find((p) => p.id === proposalId) : undefined;
     const now = new Date().toISOString();
-    const attId = sanitizeStr(body.id, 80) || `att_${crypto.randomUUID()}`;
+    const attId = reqAttId || `att_${crypto.randomUUID()}`;
 
     const attachment = {
       id: attId,

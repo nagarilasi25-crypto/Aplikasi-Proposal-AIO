@@ -1,11 +1,16 @@
 import { GoogleAuthProvider, signInWithPopup, signOut, User as FirebaseUser } from 'firebase/auth';
 import {
+  collection,
   deleteDoc,
   doc,
   getDoc,
+  getDocs,
+  query,
   serverTimestamp,
   setDoc,
+  Timestamp,
   updateDoc,
+  where,
 } from 'firebase/firestore';
 import {
   auth,
@@ -16,11 +21,14 @@ import {
 } from './firebase';
 import { recordAuditLog } from './audit';
 import {
+  describeOfflineMutation,
   enqueueFirestoreMutation,
   FirestoreSyncCollection,
   FirestoreSyncItem,
   getFirestoreSyncQueue,
+  OfflineSyncMutation,
   removeFirestoreSyncItem,
+  SyncItemReport,
   updateFirestoreSyncItem,
 } from './offlineDb';
 import {
@@ -475,15 +483,21 @@ let firestoreSyncLock = false;
 export async function processFirestoreSyncQueue(options?: {
   institutionFallback?: InstitutionProfile | null;
   onQueueChange?: (items: FirestoreSyncItem[]) => void;
-}): Promise<{ syncedCount: number; failedCount: number; lastError: string | null }> {
+}): Promise<{
+  syncedCount: number;
+  failedCount: number;
+  lastError: string | null;
+  items: SyncItemReport[];
+}> {
   if (firestoreSyncLock) {
-    return { syncedCount: 0, failedCount: 0, lastError: null };
+    return { syncedCount: 0, failedCount: 0, lastError: null, items: [] };
   }
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
     return {
       syncedCount: 0,
       failedCount: 0,
       lastError: 'Perangkat masih offline. Perubahan menunggu koneksi internet.',
+      items: [],
     };
   }
   const currentUser = auth.currentUser;
@@ -492,18 +506,20 @@ export async function processFirestoreSyncQueue(options?: {
       syncedCount: 0,
       failedCount: 0,
       lastError: 'Akun Google Firestore belum terhubung.',
+      items: [],
     };
   }
 
   const queue = await getFirestoreSyncQueue();
   if (queue.length === 0) {
-    return { syncedCount: 0, failedCount: 0, lastError: null };
+    return { syncedCount: 0, failedCount: 0, lastError: null, items: [] };
   }
 
   firestoreSyncLock = true;
   let syncedCount = 0;
   let failedCount = 0;
   let lastError: string | null = null;
+  const itemReports: SyncItemReport[] = [];
 
   try {
     const connected = await testConnection();
@@ -512,6 +528,7 @@ export async function processFirestoreSyncQueue(options?: {
         syncedCount: 0,
         failedCount: 0,
         lastError: 'Koneksi ke Firestore belum siap. Mencoba ulang saat online.',
+        items: [],
       };
     }
 
@@ -537,6 +554,12 @@ export async function processFirestoreSyncQueue(options?: {
         await applyFirestoreItem(item, currentUser.uid);
         await removeFirestoreSyncItem(item.id);
         syncedCount += 1;
+        itemReports.push({
+          id: item.id,
+          label: item.label,
+          target: 'firestore',
+          status: 'synced',
+        });
       } catch (err) {
         failedCount += 1;
         lastError = formatFirestoreErrorForDisplay(err);
@@ -544,6 +567,13 @@ export async function processFirestoreSyncQueue(options?: {
           status: 'failed',
           retryCount: (item.retryCount || 0) + 1,
           lastError,
+        });
+        itemReports.push({
+          id: item.id,
+          label: item.label,
+          target: 'firestore',
+          status: 'failed',
+          error: lastError,
         });
       }
 
@@ -573,7 +603,7 @@ export async function processFirestoreSyncQueue(options?: {
     }
   }
 
-  return { syncedCount, failedCount, lastError };
+  return { syncedCount, failedCount, lastError, items: itemReports };
 }
 
 export async function enqueueFullSnapshotToFirestore(snapshot: {
@@ -682,17 +712,520 @@ export async function enqueueFullSnapshotToFirestore(snapshot: {
 }
 
 export async function enqueueEntityToFirestore(
-  collection: FirestoreSyncCollection,
+  collectionName: FirestoreSyncCollection,
   docId: string,
   operation: 'upsert' | 'delete',
   payload: Record<string, unknown>,
   label: string
 ): Promise<void> {
   await enqueueFirestoreMutation({
-    collection,
-    docId: sanitizeFirestoreId(docId, collection.slice(0, 4)),
+    collection: collectionName,
+    docId: sanitizeFirestoreId(docId, collectionName.slice(0, 4)),
     operation,
     payload,
     label,
   });
 }
+
+export async function enqueueSyncMutationsToFirestore(
+  mutations: OfflineSyncMutation[],
+  localSnapshot: {
+    institution: InstitutionProfile | null;
+    categories: ProposalCategory[];
+    templates: ProposalTemplate[];
+    proposals: ProposalRecord[];
+    budgets: ProposalBudget[];
+    attachments: ProposalAttachment[];
+  }
+): Promise<{ enqueuedCount: number; skippedReports: SyncItemReport[] }> {
+  let enqueuedCount = 0;
+  const skippedReports: SyncItemReport[] = [];
+
+  for (const mut of mutations) {
+    const label = describeOfflineMutation(mut);
+    const body = (mut.body || {}) as Record<string, unknown>;
+    const urlId = mut.endpoint.split('/').pop() || '';
+
+    if (mut.endpoint === '/api/institution' || mut.endpoint === '/api/institution/upload') {
+      const sourceInst = localSnapshot.institution || (body as unknown as InstitutionProfile);
+      await enqueueFirestoreMutation({
+        collection: 'institutions',
+        docId: INSTITUTION_DOC_ID,
+        operation: 'upsert',
+        payload: buildInstitutionFirestorePayload(sourceInst),
+        label,
+      });
+      enqueuedCount += 1;
+      continue;
+    }
+
+    if (mut.endpoint.startsWith('/api/categories')) {
+      const catId = sanitizeFirestoreId(
+        (typeof body.id === 'string' && body.id) || (urlId !== 'categories' ? urlId : ''),
+        'cat'
+      );
+      if (mut.method === 'DELETE') {
+        await enqueueFirestoreMutation({
+          collection: 'proposalCategories',
+          docId: catId,
+          operation: 'delete',
+          payload: {},
+          label,
+        });
+      } else {
+        const matched = localSnapshot.categories.find((c) => c.id === catId);
+        await enqueueFirestoreMutation({
+          collection: 'proposalCategories',
+          docId: catId,
+          operation: 'upsert',
+          payload: buildCategoryFirestorePayload(
+            matched || (body as unknown as ProposalCategory)
+          ),
+          label,
+        });
+      }
+      enqueuedCount += 1;
+      continue;
+    }
+
+    if (mut.endpoint.startsWith('/api/templates')) {
+      const tplId = sanitizeFirestoreId(
+        (typeof body.id === 'string' && body.id) || (urlId !== 'templates' ? urlId : ''),
+        'tpl'
+      );
+      if (mut.method === 'DELETE') {
+        await enqueueFirestoreMutation({
+          collection: 'proposalTemplates',
+          docId: tplId,
+          operation: 'delete',
+          payload: {},
+          label,
+        });
+      } else {
+        const matched = localSnapshot.templates.find((t) => t.id === tplId);
+        await enqueueFirestoreMutation({
+          collection: 'proposalTemplates',
+          docId: tplId,
+          operation: 'upsert',
+          payload: buildTemplateFirestorePayload(
+            matched || (body as unknown as ProposalTemplate)
+          ),
+          label,
+        });
+      }
+      enqueuedCount += 1;
+      continue;
+    }
+
+    if (/^\/api\/proposals\/[^/]+\/status$/.test(mut.endpoint)) {
+      const parts = mut.endpoint.split('/');
+      const propId = sanitizeFirestoreId(parts[3] || '', 'prop');
+      const matched = localSnapshot.proposals.find((p) => p.id === propId);
+      if (matched) {
+        await enqueueFirestoreMutation({
+          collection: 'proposals',
+          docId: propId,
+          operation: 'upsert',
+          payload: buildProposalFirestorePayload(matched),
+          label: `Proposal: ${matched.title}`,
+        });
+        enqueuedCount += 1;
+      } else {
+        skippedReports.push({
+          id: mut.id,
+          label,
+          target: 'firestore',
+          status: 'skipped',
+          error: 'Data proposal induk tidak ditemukan di cache lokal.',
+        });
+      }
+      continue;
+    }
+
+    if (mut.endpoint.startsWith('/api/proposals')) {
+      const propId = sanitizeFirestoreId(
+        (typeof body.id === 'string' && body.id) || (urlId !== 'proposals' ? urlId : ''),
+        'prop'
+      );
+      if (mut.method === 'DELETE') {
+        await enqueueFirestoreMutation({
+          collection: 'proposals',
+          docId: propId,
+          operation: 'delete',
+          payload: {},
+          label,
+        });
+      } else {
+        const matched = localSnapshot.proposals.find((p) => p.id === propId);
+        const sourceProp = matched || (body as unknown as ProposalRecord);
+        await enqueueFirestoreMutation({
+          collection: 'proposals',
+          docId: propId,
+          operation: 'upsert',
+          payload: buildProposalFirestorePayload(sourceProp),
+          label,
+        });
+        if (sourceProp.isArchived) {
+          await enqueueFirestoreMutation({
+            collection: 'proposalArchives',
+            docId: propId,
+            operation: 'upsert',
+            payload: buildArchiveFirestorePayload(sourceProp),
+            label: `Arsip: ${sourceProp.title}`,
+          });
+        }
+      }
+      enqueuedCount += 1;
+      continue;
+    }
+
+    if (mut.endpoint.startsWith('/api/budgets')) {
+      const budgetId = sanitizeFirestoreId(
+        (typeof body.id === 'string' && body.id) || (urlId !== 'budgets' ? urlId : ''),
+        'rab'
+      );
+      if (mut.method === 'DELETE') {
+        await enqueueFirestoreMutation({
+          collection: 'proposalBudgets',
+          docId: budgetId,
+          operation: 'delete',
+          payload: {},
+          label,
+        });
+      } else {
+        const matched = localSnapshot.budgets.find(
+          (b) => b.id === budgetId || b.proposalId === body.proposalId
+        );
+        await enqueueFirestoreMutation({
+          collection: 'proposalBudgets',
+          docId: sanitizeFirestoreId(matched?.id || budgetId, 'rab'),
+          operation: 'upsert',
+          payload: buildBudgetFirestorePayload(
+            matched || (body as unknown as ProposalBudget)
+          ),
+          label,
+        });
+      }
+      enqueuedCount += 1;
+      continue;
+    }
+
+    if (mut.endpoint.startsWith('/api/attachments')) {
+      const attId = sanitizeFirestoreId(
+        (typeof body.id === 'string' && body.id) || (urlId !== 'attachments' ? urlId : ''),
+        'att'
+      );
+      if (mut.method === 'DELETE') {
+        await enqueueFirestoreMutation({
+          collection: 'proposalAttachments',
+          docId: attId,
+          operation: 'delete',
+          payload: {},
+          label,
+        });
+        enqueuedCount += 1;
+      } else {
+        const matched = localSnapshot.attachments.find((a) => a.id === attId);
+        const payload = buildAttachmentFirestorePayload(
+          matched || (body as unknown as ProposalAttachment)
+        );
+        if (payload) {
+          await enqueueFirestoreMutation({
+            collection: 'proposalAttachments',
+            docId: attId,
+            operation: 'upsert',
+            payload,
+            label,
+          });
+          enqueuedCount += 1;
+        } else {
+          skippedReports.push({
+            id: mut.id,
+            label,
+            target: 'firestore',
+            status: 'skipped',
+            error: 'Lampiran belum tertaut ke proposal tertentu (disimpan lokal).',
+          });
+        }
+      }
+      continue;
+    }
+
+    skippedReports.push({
+      id: mut.id,
+      label,
+      target: 'firestore',
+      status: 'skipped',
+      error: 'Pengaturan/profil akun lokal tidak memerlukan koleksi Firestore terpisah.',
+    });
+  }
+
+  return { enqueuedCount, skippedReports };
+}
+
+function timestampToIso(value: unknown, fallback = ''): string {
+  if (value instanceof Timestamp) {
+    return value.toDate().toISOString();
+  }
+  if (
+    value &&
+    typeof value === 'object' &&
+    typeof (value as { toDate?: () => Date }).toDate === 'function'
+  ) {
+    return (value as { toDate: () => Date }).toDate().toISOString();
+  }
+  if (typeof value === 'string') return value;
+  return fallback;
+}
+
+export interface PulledFirestoreSnapshot {
+  institution: InstitutionProfile | null;
+  categories: ProposalCategory[];
+  templates: ProposalTemplate[];
+  proposals: ProposalRecord[];
+  budgets: ProposalBudget[];
+  attachments: ProposalAttachment[];
+  statusHistory: ProposalStatusHistory[];
+  counts: {
+    institutions: number;
+    categories: number;
+    templates: number;
+    proposals: number;
+    budgets: number;
+    attachments: number;
+    archives: number;
+    statusHistory: number;
+  };
+}
+
+export async function pullSnapshotFromFirestore(): Promise<PulledFirestoreSnapshot> {
+  const currentUser = auth.currentUser;
+  if (!currentUser || !currentUser.emailVerified) {
+    throw new Error('Akun Google Firestore belum terhubung.');
+  }
+
+  const connected = await testConnection();
+  if (!connected) {
+    throw new Error('Koneksi ke Cloud Firestore tidak tersedia saat ini.');
+  }
+
+  let institution: InstitutionProfile | null = null;
+  const instPath = `institutions/${INSTITUTION_DOC_ID}`;
+  try {
+    const instSnap = await getDoc(doc(db, 'institutions', INSTITUTION_DOC_ID));
+    if (instSnap.exists()) {
+      const d = instSnap.data();
+      institution = {
+        name: String(d.name || ''),
+        logoUrl: String(d.logoUrl || ''),
+        photoUrl: String(d.photoUrl || ''),
+        address: String(d.address || ''),
+        kecamatan: String(d.kecamatan || ''),
+        kabupaten: String(d.kabupaten || ''),
+        provinsi: String(d.provinsi || ''),
+        negara: String(d.negara || ''),
+        phone: String(d.phone || ''),
+        email: String(d.email || ''),
+        foundedYear: String(d.foundedYear || ''),
+        statisticNumber: String(d.statisticNumber || ''),
+        legalityInfo: String(d.legalityInfo || ''),
+        leaderName: String(d.leaderName || ''),
+        history: String(d.history || ''),
+        vision: String(d.vision || ''),
+        mission: String(d.mission || ''),
+        organizationStructure: String(d.organizationStructure || ''),
+        studentCount: Number(d.studentCount) || 0,
+        teacherCount: Number(d.teacherCount) || 0,
+        createdAt: timestampToIso(d.createdAt),
+        updatedAt: timestampToIso(d.updatedAt),
+        createdBy: String(d.createdBy || ''),
+        updatedBy: String(d.updatedBy || ''),
+      };
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, instPath);
+  }
+
+  const fetchCollectionDocs = async (colName: string) => {
+    try {
+      const q = query(
+        collection(db, colName),
+        where('institutionId', '==', INSTITUTION_DOC_ID)
+      );
+      const snap = await getDocs(q);
+      return snap.docs;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, colName);
+    }
+  };
+
+  const [catDocs, tplDocs, propDocs, budgetDocs, attDocs, archiveDocs, histDocs] =
+    await Promise.all([
+      fetchCollectionDocs('proposalCategories'),
+      fetchCollectionDocs('proposalTemplates'),
+      fetchCollectionDocs('proposals'),
+      fetchCollectionDocs('proposalBudgets'),
+      fetchCollectionDocs('proposalAttachments'),
+      fetchCollectionDocs('proposalArchives'),
+      fetchCollectionDocs('proposalStatusHistory'),
+    ]);
+
+  const categories: ProposalCategory[] = catDocs.map((docSnap) => {
+    const d = docSnap.data();
+    return {
+      id: docSnap.id,
+      institutionId: String(d.institutionId || INSTITUTION_DOC_ID),
+      name: String(d.name || ''),
+      code: String(d.code || ''),
+      description: String(d.description || ''),
+      isActive: d.isActive !== false,
+      createdAt: timestampToIso(d.createdAt),
+      updatedAt: timestampToIso(d.updatedAt),
+    };
+  });
+
+  const templates: ProposalTemplate[] = tplDocs.map((docSnap) => {
+    const d = docSnap.data();
+    return {
+      id: docSnap.id,
+      institutionId: String(d.institutionId || INSTITUTION_DOC_ID),
+      name: String(d.name || ''),
+      proposalType: String(d.type || 'Umum'),
+      description: String(d.description || ''),
+      sections: Array.isArray(d.sections) ? d.sections : [],
+      isDefault: false,
+      isActive: d.isActive !== false,
+      createdAt: timestampToIso(d.createdAt),
+      updatedAt: timestampToIso(d.updatedAt),
+      createdBy: String(d.createdBy || ''),
+      updatedBy: String(d.updatedBy || ''),
+    };
+  });
+
+  const archivedProposalIds = new Set(
+    archiveDocs.map((docSnap) => String(docSnap.data().proposalId || docSnap.id))
+  );
+
+  const proposals: ProposalRecord[] = propDocs.map((docSnap) => {
+    const d = docSnap.data();
+    const isArchived = archivedProposalIds.has(docSnap.id);
+    return {
+      id: docSnap.id,
+      institutionId: String(d.institutionId || INSTITUTION_DOC_ID),
+      proposalNumber: String(d.proposalNumber || ''),
+      proposalDate: String(d.proposalDate || ''),
+      fiscalYear: Number(d.fiscalYear) || new Date().getFullYear(),
+      title: String(d.title || ''),
+      categoryId: String(d.categoryId || ''),
+      categoryName: String(d.categoryName || ''),
+      templateId: '',
+      proposalType: String(d.proposalType || ''),
+      recipientName: String(d.recipientName || ''),
+      recipientInstitution: String(d.recipientInstitution || ''),
+      recipientAddress: '',
+      location: String(d.location || ''),
+      executionTime: String(d.executionTime || ''),
+      summary: String(d.activityDescription || ''),
+      sections: Array.isArray(d.sectionsContent) ? d.sectionsContent : [],
+      attachmentIds: [],
+      isArchived,
+      archivedAt: isArchived ? timestampToIso(d.updatedAt) : '',
+      status: (PROPOSAL_STATUS_ORDER.includes(d.status) ? d.status : 'Draft') as ProposalRecord['status'],
+      totalBudget: Number(d.totalBudget) || 0,
+      approvedAmount: Number(d.approvedAmount) || 0,
+      receivedAmount: Number(d.receivedAmount) || 0,
+      submittedAt: String(d.submittedAt || ''),
+      approvedAt: '',
+      rejectedReason: '',
+      followUpNotes: String(d.followUpNotes || ''),
+      createdAt: timestampToIso(d.createdAt),
+      updatedAt: timestampToIso(d.updatedAt),
+      createdBy: String(d.createdBy || ''),
+      updatedBy: String(d.updatedBy || ''),
+    };
+  });
+
+  const propTitleById = new Map<string, string>(proposals.map((p) => [p.id, p.title]));
+
+  const budgets: ProposalBudget[] = budgetDocs.map((docSnap) => {
+    const d = docSnap.data();
+    const proposalId = String(d.proposalId || '');
+    return {
+      id: docSnap.id,
+      institutionId: String(d.institutionId || INSTITUTION_DOC_ID),
+      proposalId,
+      proposalTitle: propTitleById.get(proposalId) || '',
+      title: String(d.workGroup || 'RAB Utama'),
+      notes: '',
+      items: Array.isArray(d.items) ? d.items : [],
+      totalAmount: Number(d.totalAmount) || 0,
+      createdAt: timestampToIso(d.createdAt),
+      updatedAt: timestampToIso(d.updatedAt),
+      createdBy: String(d.createdBy || ''),
+      updatedBy: String(d.updatedBy || ''),
+    };
+  });
+
+  const attachments: ProposalAttachment[] = attDocs.map((docSnap) => {
+    const d = docSnap.data();
+    const proposalId = String(d.proposalId || '');
+    const mimeType = String(d.fileType || 'image/jpeg');
+    return {
+      id: docSnap.id,
+      institutionId: String(d.institutionId || INSTITUTION_DOC_ID),
+      proposalId,
+      proposalTitle: propTitleById.get(proposalId) || '',
+      category: (d.category || 'Lainnya') as ProposalAttachment['category'],
+      title: String(d.title || 'Lampiran'),
+      description: '',
+      fileUrl: String(d.fileUrl || ''),
+      fileName: String(d.fileName || ''),
+      mimeType,
+      fileSize: 0,
+      isImage: !mimeType.includes('pdf'),
+      createdAt: timestampToIso(d.createdAt),
+      updatedAt: timestampToIso(d.updatedAt),
+      createdBy: String(d.createdBy || ''),
+    };
+  });
+
+  const statusHistory: ProposalStatusHistory[] = histDocs.map((docSnap) => {
+    const d = docSnap.data();
+    const proposalId = String(d.proposalId || '');
+    return {
+      id: docSnap.id,
+      institutionId: String(d.institutionId || INSTITUTION_DOC_ID),
+      proposalId,
+      proposalTitle: propTitleById.get(proposalId) || '',
+      fromStatus: d.fromStatus ? (String(d.fromStatus) as ProposalStatusHistory['fromStatus']) : undefined,
+      toStatus: (PROPOSAL_STATUS_ORDER.includes(d.toStatus)
+        ? d.toStatus
+        : 'Draft') as ProposalStatusHistory['toStatus'],
+      notes: String(d.notes || ''),
+      actorUid: String(d.createdBy || ''),
+      actorName: 'Pengguna',
+      createdAt: timestampToIso(d.createdAt),
+    };
+  });
+
+  return {
+    institution,
+    categories,
+    templates,
+    proposals,
+    budgets,
+    attachments,
+    statusHistory,
+    counts: {
+      institutions: institution ? 1 : 0,
+      categories: categories.length,
+      templates: templates.length,
+      proposals: proposals.length,
+      budgets: budgets.length,
+      attachments: attachments.length,
+      archives: archiveDocs.length,
+      statusHistory: statusHistory.length,
+    },
+  };
+}
+

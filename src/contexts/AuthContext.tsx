@@ -29,6 +29,7 @@ import {
   clearAllOfflineAuthAccounts,
   clearFirestoreSyncQueue,
   clearOfflineMutationQueue,
+  describeOfflineMutation,
   enqueueOfflineMutation,
   FirestoreSyncItem,
   getAllOfflineUsers,
@@ -37,12 +38,15 @@ import {
   getOfflineMutationQueue,
   hasActiveOfflineAdmin,
   hasOfflineUsername,
+  OfflineSyncMutation,
   recoverOfflineUsername,
   removeOfflineMutation,
   resetFailedFirestoreItems,
   resetOfflineAccount,
   setOfflineKV,
+  SyncItemReport,
   updateOfflineAuthUserMetadata,
+  updateOfflineMutationStatus,
   verifyActiveOfflineAdmin,
   verifyOfflineAuthCredentialDetailed,
 } from '../lib/offlineDb';
@@ -58,7 +62,9 @@ import {
   buildTemplateFirestorePayload,
   enqueueEntityToFirestore,
   enqueueFullSnapshotToFirestore,
+  enqueueSyncMutationsToFirestore,
   processFirestoreSyncQueue,
+  pullSnapshotFromFirestore,
   signInFirebaseWithGoogle,
   signOutFirebase,
 } from '../lib/firestoreSync';
@@ -261,32 +267,78 @@ interface AuthContextValue {
   serverApiAvailable: boolean;
   hasServerSession: boolean;
   pendingSyncCount: number;
+  pendingSyncItems: OfflineSyncMutation[];
   syncing: boolean;
   lastSyncError: string | null;
+  lastSyncReport: SyncItemReport[];
   reconnectModalOpen: boolean;
   openReconnectModal: () => void;
   closeReconnectModal: () => void;
-  syncNow: () => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
+  syncNow: () => Promise<{
+    syncedCount: number;
+    failedCount: number;
+    lastError: string | null;
+    items?: SyncItemReport[];
+  }>;
   clearPendingQueue: () => Promise<void>;
   reconnectServerSession: (
     password: string,
     options?: { approverUsername?: string; approverPassword?: string }
-  ) => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
+  ) => Promise<{
+    syncedCount: number;
+    failedCount: number;
+    lastError: string | null;
+    items?: SyncItemReport[];
+  }>;
   firebaseUser: FirebaseUser | null;
   firestoreConnected: boolean;
   firestoreQueue: FirestoreSyncItem[];
   pendingFirestoreCount: number;
   firestoreSyncing: boolean;
   lastFirestoreSyncError: string | null;
+  lastFirestoreSyncReport: SyncItemReport[];
   cloudSyncModalOpen: boolean;
   openCloudSyncModal: () => void;
   closeCloudSyncModal: () => void;
-  connectFirestoreCloud: () => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
+  connectFirestoreCloud: () => Promise<{
+    syncedCount: number;
+    failedCount: number;
+    lastError: string | null;
+    items?: SyncItemReport[];
+  }>;
   disconnectFirestoreCloud: () => Promise<void>;
-  syncFirestoreNow: () => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
-  pushAllLocalToFirestore: () => Promise<{ enqueuedCount: number; syncedCount: number; failedCount: number; lastError: string | null }>;
+  syncFirestoreNow: () => Promise<{
+    syncedCount: number;
+    failedCount: number;
+    lastError: string | null;
+    items?: SyncItemReport[];
+  }>;
+  pullFromFirestore: () => Promise<{
+    counts: {
+      institutions: number;
+      categories: number;
+      templates: number;
+      proposals: number;
+      budgets: number;
+      attachments: number;
+      archives: number;
+      statusHistory: number;
+    };
+  }>;
+  pushAllLocalToFirestore: () => Promise<{
+    enqueuedCount: number;
+    syncedCount: number;
+    failedCount: number;
+    lastError: string | null;
+    items?: SyncItemReport[];
+  }>;
   clearFirestoreQueue: () => Promise<void>;
-  retryFailedFirestoreSync: () => Promise<{ syncedCount: number; failedCount: number; lastError: string | null }>;
+  retryFailedFirestoreSync: () => Promise<{
+    syncedCount: number;
+    failedCount: number;
+    lastError: string | null;
+    items?: SyncItemReport[];
+  }>;
   pendingStatusUser: AppUser | null;
   authError: string | null;
   authNotice: string | null;
@@ -425,13 +477,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isOfflineSession, setIsOfflineSession] = useState(false);
   const [serverApiAvailable, setServerApiAvailable] = useState(true);
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
+  const [pendingSyncItems, setPendingSyncItems] = useState<OfflineSyncMutation[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [lastSyncError, setLastSyncError] = useState<string | null>(null);
+  const [lastSyncReport, setLastSyncReport] = useState<SyncItemReport[]>([]);
   const [reconnectModalOpen, setReconnectModalOpen] = useState(false);
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [firestoreQueue, setFirestoreQueue] = useState<FirestoreSyncItem[]>([]);
   const [firestoreSyncing, setFirestoreSyncing] = useState(false);
   const [lastFirestoreSyncError, setLastFirestoreSyncError] = useState<string | null>(null);
+  const [lastFirestoreSyncReport, setLastFirestoreSyncReport] = useState<SyncItemReport[]>([]);
   const [cloudSyncModalOpen, setCloudSyncModalOpen] = useState(false);
   const [pendingStatusUser, setPendingStatusUser] = useState<AppUser | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -447,6 +502,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       getFirestoreSyncQueue(),
     ]);
     setPendingSyncCount(queue.length);
+    setPendingSyncItems(queue);
     setFirestoreQueue(fsQueue);
   }, []);
 
@@ -811,14 +867,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const flushQueueWithToken = useCallback(
     async (
       tokenToUse: string
-    ): Promise<{ syncedCount: number; failedCount: number; lastError: string | null }> => {
+    ): Promise<{
+      syncedCount: number;
+      failedCount: number;
+      lastError: string | null;
+      items: SyncItemReport[];
+    }> => {
       if (syncInFlightRef.current) {
-        return { syncedCount: 0, failedCount: 0, lastError: null };
+        return { syncedCount: 0, failedCount: 0, lastError: null, items: [] };
       }
       const rawQueue = await getOfflineMutationQueue();
       if (rawQueue.length === 0) {
         setLastSyncError(null);
-        return { syncedCount: 0, failedCount: 0, lastError: null };
+        return { syncedCount: 0, failedCount: 0, lastError: null, items: [] };
       }
 
       syncInFlightRef.current = true;
@@ -831,9 +892,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       let syncedCount = 0;
       let failedCount = 0;
       let lastError: string | null = null;
+      const itemReports: SyncItemReport[] = [];
 
       try {
         for (const item of queue) {
+          const label = describeOfflineMutation(item);
           try {
             await apiRequest(item.endpoint, {
               method: item.method,
@@ -842,31 +905,76 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             });
             await removeOfflineMutation(item.id);
             syncedCount += 1;
+            itemReports.push({
+              id: item.id,
+              label,
+              target: 'server',
+              status: 'synced',
+            });
           } catch (err) {
             if (err instanceof AuthSessionError) {
               downgradeToOfflineSession();
               lastError = 'Sesi server kedaluwarsa. Masukkan kata sandi untuk menyambung kembali.';
               setLastSyncError(lastError);
+              await updateOfflineMutationStatus(item.id, {
+                retryCount: (item.retryCount || 0) + 1,
+                lastError,
+              });
+              itemReports.push({
+                id: item.id,
+                label,
+                target: 'server',
+                status: 'failed',
+                error: lastError,
+              });
               break;
             }
             if (err instanceof TypeError || err instanceof RecoverableTransportError) {
               lastError = 'Server belum merespons saat menyinkronkan.';
               setLastSyncError(lastError);
+              await updateOfflineMutationStatus(item.id, {
+                retryCount: (item.retryCount || 0) + 1,
+                lastError,
+              });
+              itemReports.push({
+                id: item.id,
+                label,
+                target: 'server',
+                status: 'failed',
+                error: lastError,
+              });
               break;
             }
             if (err instanceof HttpClientError && err.status === 404 && item.method === 'DELETE') {
-              // Target already absent on server; safe to clear from queue
               await removeOfflineMutation(item.id);
               syncedCount += 1;
+              itemReports.push({
+                id: item.id,
+                label,
+                target: 'server',
+                status: 'synced',
+              });
               continue;
             }
             failedCount += 1;
             lastError =
               err instanceof Error ? err.message : 'Sebagian perubahan gagal disinkronkan.';
             setLastSyncError(lastError);
+            await updateOfflineMutationStatus(item.id, {
+              retryCount: (item.retryCount || 0) + 1,
+              lastError,
+            });
+            itemReports.push({
+              id: item.id,
+              label,
+              target: 'server',
+              status: 'failed',
+              error: lastError,
+            });
           }
         }
       } finally {
+        setLastSyncReport(itemReports);
         await refreshQueueCount();
         setSyncing(false);
         syncInFlightRef.current = false;
@@ -876,37 +984,63 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         await refreshDashboardData(tokenToUse);
       }
 
-      return { syncedCount, failedCount, lastError };
+      return { syncedCount, failedCount, lastError, items: itemReports };
     },
     [apiRequest, downgradeToOfflineSession, refreshDashboardData, refreshQueueCount]
   );
+
+  const rescueApiQueueToFirestore = useCallback(async (): Promise<SyncItemReport[]> => {
+    const existingApi = await getOfflineMutationQueue();
+    if (existingApi.length === 0) return [];
+    const { skippedReports } = await enqueueSyncMutationsToFirestore(existingApi, {
+      institution,
+      categories,
+      templates,
+      proposals,
+      budgets,
+      attachments,
+    });
+    await refreshQueueCount();
+    return skippedReports;
+  }, [attachments, budgets, categories, institution, proposals, refreshQueueCount, templates]);
 
   const flushFirestoreNow = useCallback(async (): Promise<{
     syncedCount: number;
     failedCount: number;
     lastError: string | null;
+    items: SyncItemReport[];
   }> => {
     setFirestoreSyncing(true);
     try {
+      const skippedFromApi = await rescueApiQueueToFirestore();
       const res = await processFirestoreSyncQueue({
         institutionFallback: institution,
         onQueueChange: setFirestoreQueue,
       });
+      const combinedItems = [...res.items, ...skippedFromApi];
       setLastFirestoreSyncError(res.lastError);
+      setLastFirestoreSyncReport(combinedItems);
+
       if (res.failedCount === 0 && !serverApiAvailable) {
         const remainingApi = await getOfflineMutationQueue();
-        if (remainingApi.length > 0) {
-          await clearOfflineMutationQueue();
-          setLastSyncError(null);
-          await refreshQueueCount();
+        const skippedIds = new Set(skippedFromApi.map((s) => s.id));
+        for (const item of remainingApi) {
+          if (!skippedIds.has(item.id)) {
+            await removeOfflineMutation(item.id);
+          }
         }
+        setLastSyncError(null);
+        await refreshQueueCount();
       }
-      return res;
+      return {
+        ...res,
+        items: combinedItems,
+      };
     } finally {
       setFirestoreQueue(await getFirestoreSyncQueue());
       setFirestoreSyncing(false);
     }
-  }, [institution, refreshQueueCount, serverApiAvailable]);
+  }, [institution, refreshQueueCount, rescueApiQueueToFirestore, serverApiAvailable]);
 
   // Flush queued offline mutations automatically when internet & session token are available
   useEffect(() => {
@@ -1800,19 +1934,156 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await clearOfflineMutationQueue();
     await refreshQueueCount();
     setLastSyncError(null);
+    setLastSyncReport([]);
   }, [refreshQueueCount]);
 
   const clearFirestoreQueue = useCallback(async () => {
     await clearFirestoreSyncQueue();
     await refreshQueueCount();
     setLastFirestoreSyncError(null);
+    setLastFirestoreSyncReport([]);
   }, [refreshQueueCount]);
+
+  const pullFromFirestore = useCallback(async () => {
+    const pulled = await pullSnapshotFromFirestore();
+    const [pendingApi, pendingFs] = await Promise.all([
+      getOfflineMutationQueue(),
+      getFirestoreSyncQueue(),
+    ]);
+
+    const pendingInst =
+      pendingApi.some((m) => m.endpoint.startsWith('/api/institution')) ||
+      pendingFs.some((f) => f.collection === 'institutions');
+
+    let nextInst = institution;
+    if (!pendingInst && pulled.institution) {
+      const mergedLogo = pulled.institution.logoUrl || institution?.logoUrl || '';
+      const mergedPhoto = pulled.institution.photoUrl || institution?.photoUrl || '';
+      nextInst = {
+        ...pulled.institution,
+        logoUrl: mergedLogo,
+        photoUrl: mergedPhoto,
+      };
+      setInstitution(nextInst);
+      await setOfflineKV('institution', nextInst);
+    }
+
+    const mergeById = <T extends { id: string }>(
+      localList: T[],
+      cloudList: T[],
+      protectedIds: Set<string>,
+      enrich?: (localItem: T | undefined, cloudItem: T) => T
+    ): T[] => {
+      const map = new Map<string, T>();
+      for (const item of localList) {
+        map.set(item.id, item);
+      }
+      for (const cloudItem of cloudList) {
+        if (protectedIds.has(cloudItem.id)) continue;
+        const existingLocal = map.get(cloudItem.id);
+        map.set(cloudItem.id, enrich ? enrich(existingLocal, cloudItem) : cloudItem);
+      }
+      return Array.from(map.values());
+    };
+
+    const extractPendingIds = (col: string, endpointPrefix: string) => {
+      const ids = new Set<string>();
+      for (const f of pendingFs) {
+        if (f.collection === col) ids.add(f.docId);
+      }
+      for (const m of pendingApi) {
+        if (m.endpoint.startsWith(endpointPrefix)) {
+          const bodyId = typeof m.body?.id === 'string' ? m.body.id : '';
+          const urlId = m.endpoint.split('/').pop() || '';
+          if (bodyId) ids.add(bodyId);
+          if (urlId) ids.add(urlId);
+        }
+      }
+      return ids;
+    };
+
+    if (pulled.categories.length > 0) {
+      const merged = mergeById(
+        categories,
+        pulled.categories,
+        extractPendingIds('proposalCategories', '/api/categories')
+      );
+      setCategories(merged);
+      await setOfflineKV('categories', merged);
+    }
+
+    if (pulled.templates.length > 0) {
+      const merged = mergeById(
+        templates,
+        pulled.templates,
+        extractPendingIds('proposalTemplates', '/api/templates')
+      );
+      setTemplates(merged);
+      await setOfflineKV('templates', merged);
+    }
+
+    if (pulled.proposals.length > 0) {
+      const merged = mergeById(
+        proposals,
+        pulled.proposals,
+        extractPendingIds('proposals', '/api/proposals'),
+        (localItem, cloudItem) => ({
+          ...cloudItem,
+          templateId: cloudItem.templateId || localItem?.templateId || '',
+          recipientAddress: cloudItem.recipientAddress || localItem?.recipientAddress || '',
+          attachmentIds:
+            localItem?.attachmentIds?.length ? localItem.attachmentIds : cloudItem.attachmentIds,
+        })
+      );
+      setProposals(merged);
+      await setOfflineKV('proposals', merged);
+    }
+
+    if (pulled.budgets.length > 0) {
+      const merged = mergeById(
+        budgets,
+        pulled.budgets,
+        extractPendingIds('proposalBudgets', '/api/budgets')
+      );
+      setBudgets(merged);
+      await setOfflineKV('budgets', merged);
+    }
+
+    if (pulled.attachments.length > 0) {
+      const merged = mergeById(
+        attachments,
+        pulled.attachments,
+        extractPendingIds('proposalAttachments', '/api/attachments'),
+        (localItem, cloudItem) => ({
+          ...cloudItem,
+          fileUrl:
+            cloudItem.fileUrl.startsWith('/offline-attachment/') && localItem?.fileUrl
+              ? localItem.fileUrl
+              : cloudItem.fileUrl,
+        })
+      );
+      setAttachments(merged);
+      await setOfflineKV('attachments', merged);
+    }
+
+    if (pulled.statusHistory.length > 0) {
+      const merged = mergeById(
+        statusHistory,
+        pulled.statusHistory,
+        new Set<string>()
+      );
+      setStatusHistory(merged);
+      await setOfflineKV('statusHistory', merged);
+    }
+
+    return { counts: pulled.counts };
+  }, [attachments, budgets, categories, institution, proposals, statusHistory, templates]);
 
   const syncFirestoreNow = useCallback(async () => {
     await resetFailedFirestoreItems();
+    const skippedFromApi = await rescueApiQueueToFirestore();
     const existingFs = await getFirestoreSyncQueue();
-    const existingApi = await getOfflineMutationQueue();
-    if (existingFs.length === 0 && existingApi.length > 0) {
+    if (existingFs.length === 0 && skippedFromApi.length === 0 && (institution?.name || proposals.length > 0)) {
       await enqueueFullSnapshotToFirestore({
         institution,
         categories,
@@ -1824,13 +2095,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
       await refreshQueueCount();
     }
-    const res = await flushFirestoreNow();
-    if (res.failedCount === 0 && !serverApiAvailable) {
-      await clearOfflineMutationQueue();
-      setLastSyncError(null);
-      await refreshQueueCount();
-    }
-    return res;
+    return flushFirestoreNow();
   }, [
     attachments,
     budgets,
@@ -1839,7 +2104,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     institution,
     proposals,
     refreshQueueCount,
-    serverApiAvailable,
+    rescueApiQueueToFirestore,
     statusHistory,
     templates,
   ]);
@@ -1861,11 +2126,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     await refreshQueueCount();
     const res = await flushFirestoreNow();
-    if (res.failedCount === 0 && !serverApiAvailable) {
-      await clearOfflineMutationQueue();
-      setLastSyncError(null);
-      await refreshQueueCount();
-    }
     return {
       enqueuedCount,
       ...res,
@@ -1878,7 +2138,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     institution,
     proposals,
     refreshQueueCount,
-    serverApiAvailable,
     statusHistory,
     templates,
   ]);
@@ -1890,11 +2149,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const user = await signInFirebaseWithGoogle();
     setFirebaseUser(user);
 
-    const [existingQueue, existingApiQueue] = await Promise.all([
-      getFirestoreSyncQueue(),
-      getOfflineMutationQueue(),
-    ]);
-    if (existingQueue.length === 0 || existingApiQueue.length > 0) {
+    const skippedFromApi = await rescueApiQueueToFirestore();
+    const existingQueue = await getFirestoreSyncQueue();
+    if (existingQueue.length === 0 && skippedFromApi.length === 0) {
       await enqueueFullSnapshotToFirestore({
         institution,
         categories,
@@ -1913,13 +2170,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         institutionFallback: institution,
         onQueueChange: setFirestoreQueue,
       });
+      const combinedItems = [...res.items, ...skippedFromApi];
       setLastFirestoreSyncError(res.lastError);
+      setLastFirestoreSyncReport(combinedItems);
+
       if (res.failedCount === 0 && !serverApiAvailable) {
-        await clearOfflineMutationQueue();
+        const remainingApi = await getOfflineMutationQueue();
+        const skippedIds = new Set(skippedFromApi.map((s) => s.id));
+        for (const item of remainingApi) {
+          if (!skippedIds.has(item.id)) {
+            await removeOfflineMutation(item.id);
+          }
+        }
         setLastSyncError(null);
         await refreshQueueCount();
       }
-      return res;
+      return {
+        ...res,
+        items: combinedItems,
+      };
     } finally {
       setFirestoreQueue(await getFirestoreSyncQueue());
       setFirestoreSyncing(false);
@@ -1931,6 +2200,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     institution,
     proposals,
     refreshQueueCount,
+    rescueApiQueueToFirestore,
     serverApiAvailable,
     statusHistory,
     templates,
@@ -1946,6 +2216,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     syncedCount: number;
     failedCount: number;
     lastError: string | null;
+    items?: SyncItemReport[];
   }> => {
     if (!navigator.onLine) {
       return {
@@ -1993,7 +2264,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     async (
       password: string,
       options?: { approverUsername?: string; approverPassword?: string }
-    ): Promise<{ syncedCount: number; failedCount: number; lastError: string | null }> => {
+    ): Promise<{
+      syncedCount: number;
+      failedCount: number;
+      lastError: string | null;
+      items?: SyncItemReport[];
+    }> => {
       if (!appUser) {
         throw new Error('Tidak ada akun aktif yang dapat dihubungkan.');
       }
@@ -2041,8 +2317,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       let activeUser = loginParsed.data?.user;
       let activeInst = loginParsed.data?.institution;
       let registrationErrorMsg: string | null = null;
+      let bootstrappedFreshServer = false;
 
-      // If this account was created locally offline and doesn't exist on server yet
       if ((!loginParsed.ok || !activeToken || !activeUser) && appUser.uid.startsWith('local_')) {
         const bootRes = await fetch('/api/auth/bootstrap-status', {
           cache: 'no-store',
@@ -2073,6 +2349,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             activeToken = setupParsed.data.token;
             activeUser = setupParsed.data.user;
             activeInst = setupParsed.data.institution;
+            bootstrappedFreshServer = true;
           } else if (!setupParsed.ok) {
             registrationErrorMsg = extractErrorMessage(
               setupParsed.data,
@@ -2136,6 +2413,79 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         );
       }
 
+      // Preserve local institution profile, master data, proposals, and RAB if server storage was freshly initialized empty
+      if (bootstrappedFreshServer) {
+        const existingQueue = await getOfflineMutationQueue();
+
+        if (
+          institution &&
+          (institution.name || institution.logoUrl || institution.photoUrl || institution.history) &&
+          (!activeInst || !activeInst.name) &&
+          !existingQueue.some((m) => m.endpoint === '/api/institution')
+        ) {
+          await enqueueOfflineMutation({
+            endpoint: '/api/institution',
+            method: 'PUT',
+            body: institution as unknown as Record<string, unknown>,
+          });
+        }
+
+        for (const cat of categories) {
+          const queuedAlready = existingQueue.some(
+            (m) => m.endpoint.includes(cat.id) || m.body?.id === cat.id
+          );
+          if (!queuedAlready) {
+            await enqueueOfflineMutation({
+              endpoint: `/api/categories/${cat.id}`,
+              method: 'PUT',
+              body: cat as unknown as Record<string, unknown>,
+            });
+          }
+        }
+
+        for (const tpl of templates) {
+          const queuedAlready = existingQueue.some(
+            (m) => m.endpoint.includes(tpl.id) || m.body?.id === tpl.id
+          );
+          if (!queuedAlready) {
+            await enqueueOfflineMutation({
+              endpoint: `/api/templates/${tpl.id}`,
+              method: 'PUT',
+              body: tpl as unknown as Record<string, unknown>,
+            });
+          }
+        }
+
+        for (const prop of proposals) {
+          const queuedAlready = existingQueue.some(
+            (m) => m.endpoint.includes(prop.id) || m.body?.id === prop.id
+          );
+          if (!queuedAlready) {
+            await enqueueOfflineMutation({
+              endpoint: `/api/proposals/${prop.id}`,
+              method: 'PUT',
+              body: prop as unknown as Record<string, unknown>,
+            });
+          }
+        }
+
+        for (const budget of budgets) {
+          const queuedAlready = existingQueue.some(
+            (m) =>
+              m.endpoint.includes(budget.id) ||
+              m.body?.id === budget.id ||
+              (m.endpoint === '/api/budgets' && m.body?.proposalId === budget.proposalId)
+          );
+          if (!queuedAlready) {
+            await enqueueOfflineMutation({
+              endpoint: `/api/budgets/${budget.id}`,
+              method: 'PUT',
+              body: budget as unknown as Record<string, unknown>,
+            });
+          }
+        }
+      }
+
       await applyAuthenticatedSession(
         username,
         password,
@@ -2146,7 +2496,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       return flushQueueWithToken(activeToken);
     },
-    [appUser, flushQueueWithToken]
+    [appUser, budgets, categories, flushQueueWithToken, institution, proposals, templates]
   );
 
   const generateAiNarrative = async (
@@ -2217,8 +2567,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
         );
         const synced = isEdit
-          ? categories.map((c) => (c.id === res.category.id ? res.category : c))
-          : [...categories, res.category];
+          ? nextCats.map((c) => (c.id === res.category.id ? res.category : c))
+          : [...nextCats.filter((c) => c.id !== localCat.id), res.category];
         setCategories(synced);
         await setOfflineKV('categories', synced);
         await refreshQueueCount();
@@ -2321,8 +2671,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
         );
         const synced = isEdit
-          ? templates.map((t) => (t.id === res.template.id ? res.template : t))
-          : [...templates, res.template];
+          ? nextTpls.map((t) => (t.id === res.template.id ? res.template : t))
+          : [...nextTpls.filter((t) => t.id !== localTpl.id), res.template];
         setTemplates(synced);
         await setOfflineKV('templates', synced);
         await refreshQueueCount();
@@ -2508,8 +2858,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
         );
         const synced = isEdit
-          ? proposals.map((p) => (p.id === res.proposal.id ? res.proposal : p))
-          : [res.proposal, ...proposals];
+          ? nextProps.map((p) => (p.id === res.proposal.id ? res.proposal : p))
+          : [res.proposal, ...nextProps.filter((p) => p.id !== localId)];
         setProposals(synced);
         await setOfflineKV('proposals', synced);
         await refreshQueueCount();
@@ -2664,10 +3014,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           method: 'PATCH',
           body: payload as unknown as Record<string, unknown>,
         });
-        const syncedProps = proposals.map((p) => (p.id === id ? res.proposal : p));
+        const syncedProps = nextProps.map((p) => (p.id === id ? res.proposal : p));
         setProposals(syncedProps);
         await setOfflineKV('proposals', syncedProps);
-        const syncedHist = [res.historyEntry, ...statusHistory];
+        const syncedHist = [res.historyEntry, ...nextHist.filter((h) => h.id !== localHist.id)];
         setStatusHistory(syncedHist);
         await setOfflineKV('statusHistory', syncedHist);
         await refreshQueueCount();
@@ -2794,11 +3144,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           body: localBudget as unknown as Record<string, unknown>,
         });
         const syncedBudgets = existing
-          ? budgets.map((b) => (b.id === res.budget.id ? res.budget : b))
-          : [res.budget, ...budgets];
+          ? nextBudgets.map((b) => (b.id === res.budget.id ? res.budget : b))
+          : [res.budget, ...nextBudgets.filter((b) => b.id !== localBudget.id)];
         setBudgets(syncedBudgets);
         await setOfflineKV('budgets', syncedBudgets);
-        const syncedProps = proposals.map((p) =>
+        const syncedProps = nextProps.map((p) =>
           p.id === payload.proposalId ? { ...p, totalBudget: res.budget.totalAmount } : p
         );
         setProposals(syncedProps);
@@ -2927,7 +3277,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             isImage: payload.isImage,
           },
         });
-        const synced = [res.attachment, ...attachments];
+        const synced = [res.attachment, ...nextAtts.filter((a) => a.id !== attId)];
         setAttachments(synced);
         await setOfflineKV('attachments', synced);
         const syncedFsPayload = buildAttachmentFirestorePayload(res.attachment);
@@ -3115,8 +3465,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         serverApiAvailable,
         hasServerSession: Boolean(sessionToken),
         pendingSyncCount,
+        pendingSyncItems,
         syncing,
         lastSyncError,
+        lastSyncReport,
         reconnectModalOpen,
         openReconnectModal,
         closeReconnectModal,
@@ -3129,12 +3481,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         pendingFirestoreCount,
         firestoreSyncing,
         lastFirestoreSyncError,
+        lastFirestoreSyncReport,
         cloudSyncModalOpen,
         openCloudSyncModal,
         closeCloudSyncModal,
         connectFirestoreCloud,
         disconnectFirestoreCloud,
         syncFirestoreNow,
+        pullFromFirestore,
         pushAllLocalToFirestore,
         clearFirestoreQueue,
         retryFailedFirestoreSync,

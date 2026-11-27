@@ -1,6 +1,18 @@
 import React, { useEffect, useState } from 'react';
-import { Cloud, Lock, RefreshCw, ShieldCheck, Trash2, UserCheck, Wifi, X } from 'lucide-react';
+import {
+  AlertCircle,
+  CheckCircle2,
+  Cloud,
+  Lock,
+  RefreshCw,
+  ShieldCheck,
+  Trash2,
+  UserCheck,
+  Wifi,
+  X,
+} from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import { describeOfflineMutation } from '../lib/offlineDb';
 import { useToast } from './Toast';
 
 export function ReconnectModal() {
@@ -14,7 +26,9 @@ export function ReconnectModal() {
     connectFirestoreCloud,
     syncFirestoreNow,
     pendingSyncCount,
+    pendingSyncItems,
     lastSyncError,
+    lastSyncReport,
     reconnectServerSession,
     clearPendingQueue,
   } = useAuth();
@@ -109,7 +123,9 @@ export function ReconnectModal() {
           'success'
         );
       }
-      closeReconnectModal();
+      if (result.failedCount === 0) {
+        closeReconnectModal();
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gagal menghubungkan ke server.';
       if (msg.startsWith('NEEDS_APPROVER:')) {
@@ -139,7 +155,7 @@ export function ReconnectModal() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-2xl">
+      <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl bg-white p-6 shadow-2xl">
         <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-4">
           <div className="flex items-center gap-2.5">
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#0F3D2E] text-white">
@@ -214,6 +230,60 @@ export function ReconnectModal() {
               )}{' '}
               dan fitur <strong className="text-[#0F3D2E]">Narasi AI</strong> dapat berjalan.
             </p>
+          )}
+
+          {pendingSyncItems.length > 0 && (
+            <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-3">
+              <p className="text-[11px] font-semibold text-[#111C18]">
+                Daftar Perubahan Lokal Tertunda ({pendingSyncItems.length})
+              </p>
+              <ul className="mt-1.5 max-h-32 space-y-1.5 overflow-y-auto text-[11px]">
+                {pendingSyncItems.map((item) => (
+                  <li key={item.id} className="rounded bg-white px-2.5 py-1.5 border border-slate-100">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate font-medium text-[#0F3D2E]">
+                        {describeOfflineMutation(item)}
+                      </span>
+                      <span className="shrink-0 text-[10px] font-mono text-slate-400">
+                        {item.method}
+                      </span>
+                    </div>
+                    {item.lastError && (
+                      <p className="mt-0.5 text-[10px] text-red-600 break-words">
+                        Gagal sebelumnya ({item.retryCount || 1}x): {item.lastError}
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {lastSyncReport.length > 0 && (
+            <div className="rounded-lg border border-slate-200 bg-white p-3">
+              <p className="text-[11px] font-semibold text-[#111C18]">
+                Laporan Sinkronisasi Terakhir
+              </p>
+              <ul className="mt-1.5 max-h-28 space-y-1 overflow-y-auto text-[11px]">
+                {lastSyncReport.map((rep) => (
+                  <li key={`${rep.target}_${rep.id}`} className="flex items-start gap-1.5">
+                    {rep.status === 'synced' ? (
+                      <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                    ) : (
+                      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-600" />
+                    )}
+                    <span
+                      className={
+                        rep.status === 'synced' ? 'text-emerald-800' : 'text-red-700'
+                      }
+                    >
+                      {rep.label}
+                      {rep.error ? ` — ${rep.error}` : ' (Berhasil)'}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
 
           {displayedError && (
